@@ -6,8 +6,7 @@ import requests
 import io
 import time
 
-# --- 1. 페이지 및 기본 설정 ---
-st.set_page_config(page_title="SnowBall", page_icon="⛄️", layout="wide")
+st.set_page_config(page_title="TeamChilly - SnowBall", page_icon="🌶️", layout="wide")
 
 def get_grade(z):
     if z >= 1.0: return 'A'
@@ -17,20 +16,17 @@ def get_grade(z):
     else: return 'F'
 
 def get_rating(score):
-    if score >= 80: return 'Strong Buy'
-    elif score >= 60: return 'Buy'
-    elif score >= 40: return 'Hold'
-    elif score >= 20: return 'Sell'
-    else: return 'Strong Sell'
+    if score >= 80: return '🔥 Strong Buy'
+    elif score >= 60: return '🛒 Buy'
+    elif score >= 40: return '⏸️ Hold'
+    elif score >= 20: return '📉 Sell'
+    else: return '🚨 Strong Sell'
 
-# --- 2. 자동 수집 및 캐싱 (24시간 유지) ---
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_market_data():
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-    
+    headers = {'User-Agent': 'Mozilla/5.0'}
     def get_t(url):
-        res = requests.get(url, headers=session.headers)
+        res = requests.get(url, headers=headers)
         df = pd.read_html(io.StringIO(res.text))[0]
         return df['Symbol' if 'Symbol' in df.columns else 'Ticker symbol'].tolist()
     
@@ -46,11 +42,11 @@ def fetch_market_data():
     for i, ticker in enumerate(tickers, 1):
         time.sleep(0.1) 
         try:
-            s = yf.Ticker(ticker, session=session)
+            # 💡 [버그 픽스] session 속성을 지우고 yfinance 자체 통신 알고리즘을 타도록 원복
+            s = yf.Ticker(ticker)
             info = s.info
             hist = s.history(period="1y")
             if hist.empty or len(hist) < 22: continue
-            if 'sector' not in info and 'currentPrice' not in info: continue
             
             c_name = info.get('shortName', info.get('longName', ticker))
             sector = info.get('sector', 'Unknown')
@@ -104,10 +100,14 @@ def fetch_market_data():
         
         if i % 10 == 0 or i == total:
             progress_bar.progress(i / total)
-            status_text.text(f"마켓 데이터 수집 중... ({i}/{total})")
+            status_text.text(f"마켓 데이터 딥다이브 중... ({i}/{total})")
 
     progress_bar.empty()
     status_text.empty()
+
+    # 💡 [버그 픽스] 수집된 데이터가 0개일 때 앱이 터지지 않고 깔끔하게 에러를 던지도록 방어
+    if len(temp_list) == 0:
+        raise ValueError("야후 파이낸스 서버가 Streamlit 클라우드 공용 IP의 접속을 전면 차단했습니다 (Too Many Requests).")
 
     df = pd.DataFrame(temp_list).replace([np.inf, -np.inf], 0).fillna(0)
     cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
@@ -136,7 +136,7 @@ def fetch_market_data():
     df['Base'] = (z_data['VAL']*0.15 + z_data['MOM']*0.15 + z_data['GRW']*0.20 + z_data['PRF']*0.20 + z_data['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
     df['최종점수'] = round(((df['Base'] - (-3.0)) / 6.0) * 100, 1).clip(0, 100)
     df['투자의견'] = df['최종점수'].apply(get_rating)
-    
+
     df['등급요약'] = [f"건전[{get_grade(z_hlt.iloc[i])}] 수익[{get_grade(z_data['PRF'].iloc[i])}] 성장[{get_grade(z_data['GRW'].iloc[i])}] 가치[{get_grade(z_data['VAL'].iloc[i])}] 모멘[{get_grade(z_data['MOM'].iloc[i])}] 환원[{get_grade(z_data['YLD'].iloc[i])}]" for i in range(len(df))]
 
     df = df.sort_values('최종점수', ascending=False).reset_index(drop=True)
@@ -144,37 +144,65 @@ def fetch_market_data():
     
     return df[['순위', '종목', '기업명', '최종점수', '투자의견', '섹터', '등급요약']], sector_stats, track_stats
 
-# --- 3. 자동 로딩 및 글로벌 세션 ---
 if 'quant_data' not in st.session_state:
     st.session_state['quant_data'] = None
+if 'sector_stats' not in st.session_state:
+    st.session_state['sector_stats'] = None
+if 'track_stats' not in st.session_state:
+    st.session_state['track_stats'] = None
 
+st.title("🌶️ TeamChilly - SnowBall")
+
+tab1, tab2, tab3 = st.tabs(["📊 대시보드", "🏆 SnowBall TOP 100", "🔍 개별 종목 분석"])
+
+# 💡 [버그 픽스] 앱 부팅 시 에러가 나면 뻗지 않고 안내문을 띄우도록 try-except 처리
 if st.session_state['quant_data'] is None:
     with st.spinner("🔄 오늘의 마켓 데이터를 준비하고 있습니다 (최초 1회 약 3~4분 소요)..."):
-        df, sec_s, trk_s = fetch_market_data()
-        st.session_state['quant_data'] = df
-        st.session_state['sector_stats'] = sec_s
-        st.session_state['track_stats'] = trk_s
-
-# --- 4. 화면 UI ---
-st.title("SnowBall")
-
-tab1, tab2, tab3 = st.tabs(["📊 대시보드", "🏆 TOP 100", "🔍 개별 종목 분석"])
+        try:
+            df, sec_s, trk_s = fetch_market_data()
+            st.session_state['quant_data'] = df
+            st.session_state['sector_stats'] = sec_s
+            st.session_state['track_stats'] = trk_s
+            st.rerun()
+        except Exception as e:
+            st.error(f"🚨 데이터 자동 수집 실패: {e}")
+            st.info("💡 해결 팁: 스트림릿 클라우드의 공용 IP가 야후로부터 일시적 차단을 당했습니다.\n\n[해결책] 맥 미니(로컬)에서 추출하신 엑셀 파일을 아래의 '📁 엑셀 파일 불러오기' 버튼으로 직접 올려주시면 24시간 내내 에러 없이 즉시 작동합니다!")
 
 with tab1:
     st.subheader("📌 SnowBall 평가 지표 (Dual-Engine 적용)")
     st.markdown("""
-    * **🛡️ 건전성:** [공통] 재무 리스크 방어력 (D/A, 이자보상배율)
+    * **🛡️ 건전성:** 재무 리스크 방어력 (D/A, 이자보상배율)
     * **📈 수익성:** [일반] ROA+영업이익률 / [금융·리츠] ROE 중심
-    * **🚀 성장성:** [공통] 펀더멘털 확장성 (매출 및 이익 성장률)
-    * **🏄 모멘텀:** [공통] 시장의 중장기 트렌드와 관심도 (12개월 추세)
-    * **🏷️ 가치도도:** [일반] PEG+P/B / [금융·리츠] P/E+P/B
+    * **🚀 성장성:** 펀더멘털 확장성 (매출 및 이익 성장률)
+    * **🏄 모멘텀:** 시장의 중장기 트렌드와 관심도 (12개월 추세)
+    * **🏷️ 가치:** [일반] PEG+P/B / [금융·리츠] P/E+P/B
     * **💰 환원율:** 주주 친화 정책 및 배당 함정(Yield Trap) 필터링
     """)
-    st.info("✅ 데이터가 자동으로 최신화되어 캐싱 중입니다. 자유롭게 탭을 이동하며 분석을 즐겨주세요!")
+    st.divider()
     
-    if st.button("🚀 데이터 강제 재수집", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🚀 데이터 강제 재수집 (야후 서버 통신)", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+    with col2:
+        uploaded_file = st.file_uploader("📁 엑셀 파일 불러오기 (차단 시 권장)", type=["xlsx"])
+        if uploaded_file is not None:
+            try:
+                df = pd.read_excel(uploaded_file)
+                st.session_state['quant_data'] = df
+                
+                cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
+                sec_s = {sct: {c: {'mean': df[df['섹터']==sct][c].mean(), 'std': df[df['섹터']==sct][c].std()} for c in cols if c in df.columns} for sct in df['섹터'].unique()}
+                trk_s = {trk: {c: {'mean': df[df['트랙']==trk][c].mean(), 'std': df[df['트랙']==trk][c].std()} for c in cols if c in df.columns} for trk in df['트랙'].unique()} if '트랙' in df.columns else {}
+                
+                st.session_state['sector_stats'] = sec_s
+                st.session_state['track_stats'] = trk_s
+                st.success("✅ 엑셀 데이터가 성공적으로 로드되었습니다! 랭킹과 분석 탭을 이용해 주세요.")
+                time.sleep(1)
+                st.rerun()
+            except Exception as e:
+                st.error(f"엑셀 로드 실패: {e}")
 
 with tab2:
     st.subheader("🏆 SnowBall 퀀트 랭킹")
@@ -190,23 +218,19 @@ with tab3:
         
     if submit_btn and ticker_input:
         if st.session_state['sector_stats'] is None:
-            st.error("⚠️ 기준 데이터가 없습니다. 대시보드에서 먼저 전체 수집을 진행해 주세요.")
+            st.error("⚠️ 기준 데이터가 없습니다. 대시보드에서 전체 수집을 하거나 엑셀 파일을 업로드해 주세요.")
         else:
             with st.spinner(f"'{ticker_input.upper()}' 종목을 분석 중입니다..."):
                 tk = ticker_input.upper().strip()
-                session = requests.Session()
-                session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-                
                 try:
-                    s = yf.Ticker(tk, session=session)
+                    s = yf.Ticker(tk)
                     info = s.info
                     hist = s.history(period="1y")
                     
-                    # 💡 [핵심] 실패 원인 상세 안내
                     if hist.empty or len(hist) < 22:
-                        st.error(f"❌ [{tk}] 분석 불가: 상장한 지 얼마 안 되었거나 주가 데이터가 부족합니다.")
+                        st.error(f"❌ [{tk}] 분석 불가: 상장한 지 얼마 안 되었거나 야후 서버가 차단했습니다.")
                     elif 'sector' not in info and 'currentPrice' not in info:
-                        st.error(f"❌ [{tk}] 분석 불가: ETF이거나 재무 데이터가 제공되지 않는 종목입니다.")
+                        st.error(f"❌ [{tk}] 분석 불가: ETF이거나 재무 데이터가 제공되지 않습니다.")
                     else:
                         sector = info.get('sector', 'Unknown')
                         track = 'FIN' if sector in ['Financial Services', 'Real Estate'] else 'STD'
@@ -282,17 +306,14 @@ with tab3:
                         col2.metric("📈 수익성", get_grade(z_scores['PRF']))
                         col3.metric("🚀 성장성", get_grade(z_scores['GRW']))
                         col4, col5, col6 = st.columns(3)
-                        col4.metric("🏷️ 가치도", get_grade(z_scores['VAL']))
+                        col4.metric("🏷️ 가치", get_grade(z_scores['VAL']))
                         col5.metric("🏄 모멘텀", get_grade(z_scores['MOM']))
                         col6.metric("💰 환원율", get_grade(z_scores['YLD']))
                         
                         if penalty > 0: st.warning(f"⚠️ 부채 위험에 따른 징벌적 감점 적용됨")
 
                 except Exception as e:
-                    # 💡 [버그 픽스] 알 수 없는 에러가 발생해도 이유를 하단에 출력
                     if "429" in str(e) or "Rate limited" in str(e):
-                        st.error("🚨 야후 파이낸스 서버가 일시적으로 요청을 차단했습니다. 잠시 후 다시 시도해주세요.")
-                        st.code(f"상세 에러 로그:\n{e}")
+                        st.error("🚨 야후 파이낸스 서버가 클라우드 IP를 일시적으로 차단했습니다.")
                     else:
-                        st.error(f"❌ 분석 실패: 서버 처리 과정에서 문제가 발생했습니다. 티커를 다시 확인해 주세요.")
-                        st.code(f"상세 에러 로그:\n{e}")
+                        st.error(f"❌ 분석 실패: 서버 처리 과정에서 문제가 발생했습니다. 티커를 확인해주세요.")
