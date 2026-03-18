@@ -112,7 +112,7 @@ def fetch_market_data(trade_day):
     status_text.empty()
 
     if len(temp_list) == 0:
-        raise ValueError("야후 파이낸스 서버 접속 차단 (Too Many Requests).")
+        raise ValueError("야후 파이낸스 서버 접속 차단")
 
     df = pd.DataFrame(temp_list).replace([np.inf, -np.inf], 0).fillna(0)
     cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
@@ -131,7 +131,6 @@ def fetch_market_data(trade_day):
 
     z_hlt = (z_data['DEBT'] + z_data['ICR']) / 2
     
-    # 💡 [핵심] Z-Score를 데이터프레임에 저장하여 개별 종목 검색 시 즉시 불러오게 함
     df['Z_HLT'] = z_hlt
     df['Z_PRF'] = z_data['PRF']
     df['Z_GRW'] = z_data['GRW']
@@ -150,11 +149,10 @@ def fetch_market_data(trade_day):
     df['최종점수'] = round(((df['Base'] - (-3.0)) / 6.0) * 100, 1).clip(0, 100)
     df['투자의견'] = df['최종점수'].apply(get_rating)
 
-    # 💡 [UI 개편] 등급요약 컬럼을 지우고 6개의 개별 컬럼으로 쪼개기
     df['건전성'] = df['Z_HLT'].apply(get_grade)
     df['수익성'] = df['Z_PRF'].apply(get_grade)
     df['성장성'] = df['Z_GRW'].apply(get_grade)
-    df['가치'] = df['Z_VAL'].apply(get_grade)
+    df['가성비'] = df['Z_VAL'].apply(get_grade)
     df['모멘텀'] = df['Z_MOM'].apply(get_grade)
     df['환원율'] = df['Z_YLD'].apply(get_grade)
 
@@ -164,7 +162,6 @@ def fetch_market_data(trade_day):
     kst = pytz.timezone('Asia/Seoul')
     update_time = datetime.datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S KST')
     
-    # 내보낼 컬럼 명시
     return df, sector_stats, track_stats, update_time
 
 # --- 3. 세션 초기화 및 사이드바 ---
@@ -174,17 +171,13 @@ if 'track_stats' not in st.session_state: st.session_state['track_stats'] = None
 if 'last_updated' not in st.session_state: st.session_state['last_updated'] = "수집 전"
 if 'is_admin' not in st.session_state: st.session_state['is_admin'] = False
 
-if st.query_params.get("admin") == "chilly2026":
+# URL 파라미터로만 관리자 접속
+if st.query_params.get("admin") == "chillixlaclffl":
     st.session_state['is_admin'] = True
 
 with st.sidebar:
-    st.markdown("<br>"*15, unsafe_allow_html=True)
-    with st.expander(" ", expanded=False): 
-        admin_pw = st.text_input("Admin Code", type="password", label_visibility="collapsed")
-        if admin_pw == "chilly2026":
-            st.session_state['is_admin'] = True
-            st.success("Admin 모드 활성")
-    st.caption("powered by TeamChilli")
+    st.markdown("<br>"*20, unsafe_allow_html=True)
+    st.caption("powered by TeamChilly")
 
 if st.session_state['quant_data'] is None:
     with st.spinner("마켓 데이터를 준비하고 있습니다..."):
@@ -198,22 +191,22 @@ if st.session_state['quant_data'] is None:
             st.rerun()
         except Exception:
             st.error("야후 파이낸스 서버 접근이 차단되었습니다 (Too Many Requests).")
-            st.info("관리자 모드로 접속하여 로컬에서 추출한 백업 데이터를 업로드해주세요.")
+            st.info("관리자 권한 URL로 접속하여 로컬 백업 데이터를 업로드해주세요.")
 
 # --- 4. 메인 화면 ---
 st.title("☃ SnowBall")
 st.caption(f"최근 데이터 동기화: {st.session_state['last_updated']} (매일 미국 프리장 오픈 시 갱신)")
 
-tab1, tab2, tab3 = st.tabs(["대시보드", "SnowBall TOP 100", "개별 종목 분석"])
+tab1, tab2, tab3 = st.tabs(["대시보드", "Snow Ball Quant TOP 100", "개별 종목 분석"])
 
 with tab1:
-    st.subheader("SnowBall 6-Pillar 평가 모델")
+    st.subheader("SnowBall 평가 모델")
     st.markdown("""
     * **건전성** 재무적으로 얼마나 안정적인지 판단
     * **수익성** 얼마나 효율적으로 이익을 내는지를 판단
     * **성장성** 매출과 이익, 펀더멘털 확장성
     * **모멘텀** 시장의 중장기 트렌드 추세 판단
-    * **값어치** 실적이나 자산에 대비한 값어치를 판단
+    * **가성비** 실적이나 자산에 대비한 값어치를 판단
     * **환원율** 주주에게 얼마나 적극적으로 이익을 돌려주는지를 판단
     """)
     st.divider()
@@ -233,7 +226,7 @@ with tab1:
             if uploaded_file is not None:
                 try:
                     df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
-                    # 엑셀에서 Z-score가 없을 경우를 대비해 예외처리
+                    # 엑셀에 A, B, C 등급 텍스트가 바로 렌더링 될 수 있도록 전처리 점검
                     if 'Z_HLT' not in df.columns: st.warning("주의: 업로드된 엑셀이 구버전 형식이라 개별 종목 분석 시 제약이 있을 수 있습니다.")
                     st.session_state['quant_data'] = df
                     st.session_state['last_updated'] = "수동 데이터 업로드 완료"
@@ -246,10 +239,9 @@ with tab1:
         st.info("데이터가 캐싱되어 작동 중입니다. 탭을 이동하며 분석 결과를 확인하세요.")
 
 with tab2:
-    st.subheader("Snow Ball Quant Ranking")
+    st.subheader("🏆 Snow Ball Quant TOP 100")
     if st.session_state['quant_data'] is not None:
-        # 💡 [UI 개편] 출력할 컬럼 순서 지정 및 숨길 데이터(Z-score 등) 제외
-        display_cols = ['순위', '종목', '기업명', '최종점수', '투자의견', '섹터', '건전성', '수익성', '성장성', '가치', '모멘텀', '환원율']
+        display_cols = ['순위', '종목', '기업명', '최종점수', '투자의견', '섹터', '건전성', '수익성', '성장성', '가성비', '모멘텀', '환원율']
         st.dataframe(
             st.session_state['quant_data'][display_cols].head(100),
             use_container_width=True,
@@ -264,7 +256,7 @@ with tab2:
                 "건전성": st.column_config.TextColumn(width="small"),
                 "수익성": st.column_config.TextColumn(width="small"),
                 "성장성": st.column_config.TextColumn(width="small"),
-                "가치": st.column_config.TextColumn(width="small"),
+                "가성비": st.column_config.TextColumn(width="small"),
                 "모멘텀": st.column_config.TextColumn(width="small"),
                 "환원율": st.column_config.TextColumn(width="small")
             }
@@ -280,9 +272,8 @@ with tab3:
         tk = ticker_input.upper().strip()
         df = st.session_state['quant_data']
         
-        # 💡 [핵심 방어막] 야후 API를 안 거치고, 우리 자체 DB(df)에서 먼저 찾아냅니다!
         if df is not None and tk in df['종목'].values:
-            with st.spinner("자체 DB에서 즉시 조회 중..."):
+            with st.spinner("조회 중..."):
                 row = df[df['종목'] == tk].iloc[0]
                 
                 final_score = row['최종점수']
@@ -292,7 +283,7 @@ with tab3:
                 track = row.get('트랙', 'Unknown')
                 
                 eval_scores = {
-                    '가치': row['Z_VAL'], '모멘텀': row['Z_MOM'], '성장성': row['Z_GRW'], 
+                    '가성비': row['Z_VAL'], '모멘텀': row['Z_MOM'], '성장성': row['Z_GRW'], 
                     '수익성': row['Z_PRF'], '환원율': row['Z_YLD'], '건전성': row['Z_HLT']
                 }
                 best_p = max(eval_scores, key=eval_scores.get)
@@ -317,16 +308,15 @@ with tab3:
                 col2.metric("수익성", row['수익성'])
                 col3.metric("성장성", row['성장성'])
                 col4, col5, col6 = st.columns(3)
-                col4.metric("가치", row['가치'])
+                col4.metric("가성비", row['가성비'])
                 col5.metric("모멘텀", row['모멘텀'])
                 col6.metric("환원율", row['환원율'])
                 
                 if penalty > 0: st.warning("부채 위험에 따른 징벌적 감점 적용됨")
                 
         else:
-            # DB에 없는 듣보잡 티커일 경우에만 최후의 수단으로 야후에 물어봅니다.
-            st.warning(f"'{tk}'는 S&P 900 목록에 없어 야후 파이낸스 실시간 수집을 시도합니다. (차단 위험 존재)")
-            with st.spinner("야후 파이낸스 실시간 수집 중..."):
+            st.warning(f"'{tk}'는 S&P 900 목록에 없어 야후 파이낸스 실시간 수집을 시도합니다.")
+            with st.spinner("실시간 수집 중..."):
                 try:
                     s = yf.Ticker(tk)
                     info = s.info
@@ -372,49 +362,56 @@ with tab3:
                         mom_score = (hist['Close'].iloc[-21] / hist['Close'].iloc[0]) - 1
 
                         raw = {'VAL': val_score, 'MOM': mom_score, 'GRW': grw_score, 'PRF': hybrid_prf, 'YLD': total_shareholder_yield, 'DEBT': debt_to_asset, 'ICR': icr_val}
-                        sct_stats = st.session_state['sector_stats'].get(sector, st.session_state['sector_stats'][list(st.session_state['sector_stats'].keys())[0]])
-                        trk_stats = st.session_state['track_stats'].get(track, st.session_state['track_stats'][list(st.session_state['track_stats'].keys())[0]])
-
-                        z_scores = {}
-                        for key in raw.keys():
-                            s_z = (raw[key] - sct_stats[key]['mean']) / (sct_stats[key]['std'] + 1e-9)
-                            t_z = (raw[key] - trk_stats[key]['mean']) / (trk_stats[key]['std'] + 1e-9)
-                            z = (s_z * 0.5 + t_z * 0.5) * (-1 if key == 'DEBT' else 1)
-                            z_scores[key] = max(-3.0, min(3.0, z))
-
-                        z_hlt = (z_scores['DEBT'] + z_scores['ICR']) / 2
-                        penalty = 0.15 * ((debt_to_asset/50)**2.5) if track == 'STD' and debt_to_asset >= 50 else 0
-                        payout_ratio = float(info.get('payoutRatio') or 0.0)
-                        trap_penalty = 2.0 if payout_ratio > 1.0 or payout_ratio < 0 else 0
-
-                        base = (z_scores['VAL']*0.15 + z_scores['MOM']*0.15 + z_scores['GRW']*0.20 + z_scores['PRF']*0.20 + z_scores['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
-                        final_score = round(max(0, min(100, ((base - (-3.0)) / 6.0) * 100)), 1)
                         
-                        eval_scores = {'가치': z_scores['VAL'], '모멘텀': z_scores['MOM'], '성장성': z_scores['GRW'], '수익성': z_scores['PRF'], '환원율': z_scores['YLD'], '건전성': z_hlt}
-                        best_p = max(eval_scores, key=eval_scores.get)
-                        worst_p = min(eval_scores, key=eval_scores.get)
+                        sct_stats = st.session_state.get('sector_stats')
+                        trk_stats = st.session_state.get('track_stats')
                         
-                        if trap_penalty > 0: summ = "배당 함정(Yield Trap) 종목입니다. 절대 주의하세요."
-                        elif final_score >= 80: summ = "흠잡을 데 없는 완벽한 수치입니다."
-                        elif final_score >= 60: summ = f"[{best_p}] 지표가 훌륭합니다. [{worst_p}] 지표만 유의하시면 안정적인 종목입니다."
-                        elif final_score >= 40: summ = f"무난한 수준입니다. [{best_p}] 지표는 긍정적이나 [{worst_p}] 지표 확인이 필요합니다."
-                        elif final_score >= 20: summ = f"[{worst_p}] 지표가 심각하여 매수에 주의가 필요합니다."
-                        else: summ = f"[{worst_p}] 지표 등 전반적인 상태가 매우 부진합니다."
+                        if not sct_stats or not trk_stats:
+                            st.error("기준 데이터가 없어 상대 평가를 진행할 수 없습니다.")
+                        else:
+                            s_stat = sct_stats.get(sector, sct_stats[list(sct_stats.keys())[0]])
+                            t_stat = trk_stats.get(track, trk_stats[list(trk_stats.keys())[0]])
 
-                        st.success(f"### {c_name} ({tk}) : {final_score} 점 ({get_rating(final_score)})")
-                        st.caption(f"섹터: {sector} | 유니버스: {'금융/리츠 트랙' if track=='FIN' else '스탠다드 트랙'} (실시간 수집)")
-                        st.info(f"총평: {summ}")
-                        
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("건전성", get_grade(z_hlt))
-                        col2.metric("수익성", get_grade(z_scores['PRF']))
-                        col3.metric("성장성", get_grade(z_scores['GRW']))
-                        col4, col5, col6 = st.columns(3)
-                        col4.metric("가치", get_grade(z_scores['VAL']))
-                        col5.metric("모멘텀", get_grade(z_scores['MOM']))
-                        col6.metric("환원율", get_grade(z_scores['YLD']))
-                        
-                        if penalty > 0: st.warning("부채 위험에 따른 징벌적 감점 적용됨")
+                            z_scores = {}
+                            for key in raw.keys():
+                                s_z = (raw[key] - s_stat[key]['mean']) / (s_stat[key]['std'] + 1e-9)
+                                t_z = (raw[key] - t_stat[key]['mean']) / (t_stat[key]['std'] + 1e-9)
+                                z = (s_z * 0.5 + t_z * 0.5) * (-1 if key == 'DEBT' else 1)
+                                z_scores[key] = max(-3.0, min(3.0, z))
+
+                            z_hlt = (z_scores['DEBT'] + z_scores['ICR']) / 2
+                            penalty = 0.15 * ((debt_to_asset/50)**2.5) if track == 'STD' and debt_to_asset >= 50 else 0
+                            payout_ratio = float(info.get('payoutRatio') or 0.0)
+                            trap_penalty = 2.0 if payout_ratio > 1.0 or payout_ratio < 0 else 0
+
+                            base = (z_scores['VAL']*0.15 + z_scores['MOM']*0.15 + z_scores['GRW']*0.20 + z_scores['PRF']*0.20 + z_scores['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
+                            final_score = round(max(0, min(100, ((base - (-3.0)) / 6.0) * 100)), 1)
+                            
+                            eval_scores = {'가성비': z_scores['VAL'], '모멘텀': z_scores['MOM'], '성장성': z_scores['GRW'], '수익성': z_scores['PRF'], '환원율': z_scores['YLD'], '건전성': z_hlt}
+                            best_p = max(eval_scores, key=eval_scores.get)
+                            worst_p = min(eval_scores, key=eval_scores.get)
+                            
+                            if trap_penalty > 0: summ = "배당 함정(Yield Trap) 종목입니다. 절대 주의하세요."
+                            elif final_score >= 80: summ = "흠잡을 데 없는 완벽한 수치입니다."
+                            elif final_score >= 60: summ = f"[{best_p}] 지표가 훌륭합니다. [{worst_p}] 지표만 유의하시면 안정적인 종목입니다."
+                            elif final_score >= 40: summ = f"무난한 수준입니다. [{best_p}] 지표는 긍정적이나 [{worst_p}] 지표 확인이 필요합니다."
+                            elif final_score >= 20: summ = f"[{worst_p}] 지표가 심각하여 매수에 주의가 필요합니다."
+                            else: summ = f"[{worst_p}] 지표 등 전반적인 상태가 매우 부진합니다."
+
+                            st.success(f"### {c_name} ({tk}) : {final_score} 점 ({get_rating(final_score)})")
+                            st.caption(f"섹터: {sector} | 유니버스: {'금융/리츠 트랙' if track=='FIN' else '스탠다드 트랙'} (실시간 수집)")
+                            st.info(f"총평: {summ}")
+                            
+                            col1, col2, col3 = st.columns(3)
+                            col1.metric("건전성", get_grade(z_hlt))
+                            col2.metric("수익성", get_grade(z_scores['PRF']))
+                            col3.metric("성장성", get_grade(z_scores['GRW']))
+                            col4, col5, col6 = st.columns(3)
+                            col4.metric("가성비", get_grade(z_scores['VAL']))
+                            col5.metric("모멘텀", get_grade(z_scores['MOM']))
+                            col6.metric("환원율", get_grade(z_scores['YLD']))
+                            
+                            if penalty > 0: st.warning("부채 위험에 따른 징벌적 감점 적용됨")
 
                 except Exception as e:
                     if "429" in str(e) or "Rate limited" in str(e): st.error("야후 서버가 일시적으로 요청을 차단했습니다.")
