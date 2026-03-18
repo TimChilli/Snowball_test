@@ -5,8 +5,9 @@ import numpy as np
 import requests
 import io
 import time
+import datetime
 
-st.set_page_config(page_title="TeamChilly - SnowBall", page_icon="🌶️", layout="wide")
+st.set_page_config(page_title="TeamChilly - SnowBall", page_icon="⛄️", layout="wide")
 
 def get_grade(z):
     if z >= 1.0: return 'A'
@@ -42,7 +43,6 @@ def fetch_market_data():
     for i, ticker in enumerate(tickers, 1):
         time.sleep(0.1) 
         try:
-            # 💡 [버그 픽스] session 속성을 지우고 yfinance 자체 통신 알고리즘을 타도록 원복
             s = yf.Ticker(ticker)
             info = s.info
             hist = s.history(period="1y")
@@ -100,12 +100,11 @@ def fetch_market_data():
         
         if i % 10 == 0 or i == total:
             progress_bar.progress(i / total)
-            status_text.text(f"마켓 데이터 딥다이브 중... ({i}/{total})")
+            status_text.text(f"마켓 데이터 수집 중... ({i}/{total})")
 
     progress_bar.empty()
     status_text.empty()
 
-    # 💡 [버그 픽스] 수집된 데이터가 0개일 때 앱이 터지지 않고 깔끔하게 에러를 던지도록 방어
     if len(temp_list) == 0:
         raise ValueError("야후 파이낸스 서버가 Streamlit 클라우드 공용 IP의 접속을 전면 차단했습니다 (Too Many Requests).")
 
@@ -144,20 +143,32 @@ def fetch_market_data():
     
     return df[['순위', '종목', '기업명', '최종점수', '투자의견', '섹터', '등급요약']], sector_stats, track_stats
 
+
+# --- 3. 세션 초기화 및 관리자 모드 세팅 ---
 if 'quant_data' not in st.session_state:
     st.session_state['quant_data'] = None
 if 'sector_stats' not in st.session_state:
     st.session_state['sector_stats'] = None
 if 'track_stats' not in st.session_state:
     st.session_state['track_stats'] = None
+if 'is_admin' not in st.session_state:
+    st.session_state['is_admin'] = False
 
-st.title("🌶️ TeamChilly - SnowBall")
+# 💡 사이드바 (관리자 로그인)
+with st.sidebar:
+    st.markdown("### 🔐 운영자 설정")
+    admin_pw = st.text_input("관리자 코드를 입력하세요", type="password")
+    # 아래는 팀칠리님만 아는 비밀번호입니다. (원하시는 대로 수정하세요!)
+    if admin_pw == "tmwmzl!@#0":
+        st.session_state['is_admin'] = True
+        st.success("✅ 관리자 모드가 활성화되었습니다.")
+    elif admin_pw != "":
+        st.session_state['is_admin'] = False
+        st.error("❌ 코드가 일치하지 않습니다.")
 
-tab1, tab2, tab3 = st.tabs(["📊 대시보드", "🏆 SnowBall TOP 100", "🔍 개별 종목 분석"])
-
-# 💡 [버그 픽스] 앱 부팅 시 에러가 나면 뻗지 않고 안내문을 띄우도록 try-except 처리
+# 자동 로딩 시도
 if st.session_state['quant_data'] is None:
-    with st.spinner("🔄 오늘의 마켓 데이터를 준비하고 있습니다 (최초 1회 약 3~4분 소요)..."):
+    with st.spinner("🔄 오늘의 마켓 데이터를 준비하고 있습니다..."):
         try:
             df, sec_s, trk_s = fetch_market_data()
             st.session_state['quant_data'] = df
@@ -165,8 +176,13 @@ if st.session_state['quant_data'] is None:
             st.session_state['track_stats'] = trk_s
             st.rerun()
         except Exception as e:
-            st.error(f"🚨 데이터 자동 수집 실패: {e}")
-            st.info("💡 해결 팁: 스트림릿 클라우드의 공용 IP가 야후로부터 일시적 차단을 당했습니다.\n\n[해결책] 맥 미니(로컬)에서 추출하신 엑셀 파일을 아래의 '📁 엑셀 파일 불러오기' 버튼으로 직접 올려주시면 24시간 내내 에러 없이 즉시 작동합니다!")
+            st.error(f"🚨 자동 수집 실패 (야후 서버 일시 차단)")
+
+
+# --- 4. 화면 UI ---
+st.title("⛄️ SnowBall")
+
+tab1, tab2, tab3 = st.tabs(["📊 대시보드", "🏆 SnowBall TOP 100", "🔍 개별 종목 분석"])
 
 with tab1:
     st.subheader("📌 SnowBall 평가 지표 (Dual-Engine 적용)")
@@ -180,29 +196,50 @@ with tab1:
     """)
     st.divider()
     
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🚀 데이터 강제 재수집 (야후 서버 통신)", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
-    with col2:
-        uploaded_file = st.file_uploader("📁 엑셀 파일 불러오기 (차단 시 권장)", type=["xlsx"])
-        if uploaded_file is not None:
-            try:
-                df = pd.read_excel(uploaded_file)
-                st.session_state['quant_data'] = df
-                
-                cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
-                sec_s = {sct: {c: {'mean': df[df['섹터']==sct][c].mean(), 'std': df[df['섹터']==sct][c].std()} for c in cols if c in df.columns} for sct in df['섹터'].unique()}
-                trk_s = {trk: {c: {'mean': df[df['트랙']==trk][c].mean(), 'std': df[df['트랙']==trk][c].std()} for c in cols if c in df.columns} for trk in df['트랙'].unique()} if '트랙' in df.columns else {}
-                
-                st.session_state['sector_stats'] = sec_s
-                st.session_state['track_stats'] = trk_s
-                st.success("✅ 엑셀 데이터가 성공적으로 로드되었습니다! 랭킹과 분석 탭을 이용해 주세요.")
-                time.sleep(1)
+    # 💡 관리자(Admin)에게만 보이는 비밀 메뉴
+    if st.session_state['is_admin']:
+        st.markdown("### 🛠️ 관리자 전용 메뉴")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🚀 데이터 강제 재수집 (야후 서버 통신)", use_container_width=True):
+                st.cache_data.clear()
                 st.rerun()
-            except Exception as e:
-                st.error(f"엑셀 로드 실패: {e}")
+            
+            # 엑셀 다운로드 기능 (CSV 형식으로 안전하게 내보내기)
+            if st.session_state['quant_data'] is not None:
+                csv_data = st.session_state['quant_data'].to_csv(index=False).encode('utf-8-sig')
+                date_str = datetime.datetime.now().strftime('%Y%m%d')
+                st.download_button(
+                    label="💾 현재 데이터 내보내기 (Excel/CSV)",
+                    data=csv_data,
+                    file_name=f"TeamChilly_SnowBall_{date_str}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+        
+        with col2:
+            uploaded_file = st.file_uploader("📁 엑셀 파일 수동 불러오기", type=["xlsx", "csv"])
+            if uploaded_file is not None:
+                try:
+                    if uploaded_file.name.endswith('.csv'):
+                        df = pd.read_csv(uploaded_file)
+                    else:
+                        df = pd.read_excel(uploaded_file)
+                    
+                    st.session_state['quant_data'] = df
+                    cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
+                    sec_s = {sct: {c: {'mean': df[df['섹터']==sct][c].mean(), 'std': df[df['섹터']==sct][c].std()} for c in cols if c in df.columns} for sct in df['섹터'].unique()}
+                    trk_s = {trk: {c: {'mean': df[df['트랙']==trk][c].mean(), 'std': df[df['트랙']==trk][c].std()} for c in cols if c in df.columns} for trk in df['트랙'].unique()} if '트랙' in df.columns else {}
+                    
+                    st.session_state['sector_stats'] = sec_s
+                    st.session_state['track_stats'] = trk_s
+                    st.success("✅ 파일 데이터가 성공적으로 로드되었습니다!")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"파일 로드 실패: {e}")
+    else:
+        st.info("✅ 데이터가 자동으로 최신화되어 캐싱 중입니다. 자유롭게 탭을 이동하며 랭킹과 개별 분석을 즐겨주세요!")
 
 with tab2:
     st.subheader("🏆 SnowBall 퀀트 랭킹")
@@ -218,7 +255,7 @@ with tab3:
         
     if submit_btn and ticker_input:
         if st.session_state['sector_stats'] is None:
-            st.error("⚠️ 기준 데이터가 없습니다. 대시보드에서 전체 수집을 하거나 엑셀 파일을 업로드해 주세요.")
+            st.error("⚠️ 기준 데이터가 없습니다. 대시보드에서 수집이 완료되었는지 확인해 주세요.")
         else:
             with st.spinner(f"'{ticker_input.upper()}' 종목을 분석 중입니다..."):
                 tk = ticker_input.upper().strip()
@@ -290,12 +327,12 @@ with tab3:
                         best_p = max(eval_scores, key=eval_scores.get)
                         worst_p = min(eval_scores, key=eval_scores.get)
                         
-                        if trap_penalty > 0: summ = "🚨 TeamChilly 경보! 번 돈보다 배당을 더 많이 주는 '배당 함정(Yield Trap)' 종목입니다. 절대 주의!"
+                        if trap_penalty > 0: summ = "🚨 경보! 번 돈보다 배당을 더 많이 주는 '배당 함정(Yield Trap)' 종목입니다. 절대 주의!"
                         elif final_score >= 80: summ = "🔥 폼 미쳤다! 흠잡을 데 없는 완벽한 주식. 당장 포트에 안 담고 뭐하시나요?"
                         elif final_score >= 60: summ = f"🛒 [{best_p}] 하나는 정말 기가 막히네요! [{worst_p}]만 눈감아준다면 든든한 국밥 같은 종목입니다."
                         elif final_score >= 40: summ = f"⏸️ 음... 쏘쏘하네요. [{best_p}]은(는) 볼만하지만, [{worst_p}]이(가) 발목을 꽉 잡고 있습니다."
                         elif final_score >= 20: summ = f"📉 굳이 이 주식을..? [{worst_p}] 상태를 보면 매수 버튼 누르던 손가락도 멈춰야 합니다."
-                        else: summ = f"🚨 TeamChilly 경보! [{worst_p}]이(가) 계좌를 살살 녹일 관상입니다. 뒤도 돌아보지 마세요!"
+                        else: summ = f"🚨 경보! [{worst_p}]이(가) 계좌를 살살 녹일 관상입니다. 뒤도 돌아보지 마세요!"
 
                         st.success(f"### {c_name} ({tk}) : {final_score} 점 ({rating})")
                         st.caption(f"섹터: {sector} | 유니버스: {'금융/리츠 트랙' if track=='FIN' else '스탠다드 트랙'}")
