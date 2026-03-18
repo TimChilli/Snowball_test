@@ -4,9 +4,9 @@ import pandas as pd
 import numpy as np
 import requests
 import io
-import time # 💡 에러 원인 해결: time 도구 가져오기
+import time
 
-# --- 1. 페이지 기본 설정 ---
+# --- 1. 페이지 및 기본 설정 ---
 st.set_page_config(page_title="TeamChilly - SnowBall", page_icon="🌶️", layout="wide")
 
 def get_grade(z):
@@ -23,19 +23,15 @@ def get_rating(score):
     elif score >= 20: return '📉 Sell'
     else: return '🚨 Strong Sell'
 
-if 'quant_data' not in st.session_state:
-    st.session_state['quant_data'] = None
-if 'sector_stats' not in st.session_state:
-    st.session_state['sector_stats'] = None
-if 'track_stats' not in st.session_state:
-    st.session_state['track_stats'] = None
-
-# 💡 [핵심] 캐싱 적용: 86400초(24시간) 동안 한 번 수집한 데이터를 기억합니다.
+# --- 2. 자동 수집 및 캐싱 (24시간 유지) ---
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_market_data():
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    # 야후 파이낸스 차단 방지를 위한 브라우저 위장
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+    
     def get_t(url):
-        res = requests.get(url, headers=headers)
+        res = requests.get(url, headers=session.headers)
         df = pd.read_html(io.StringIO(res.text))[0]
         return df['Symbol' if 'Symbol' in df.columns else 'Ticker symbol'].tolist()
     
@@ -43,14 +39,16 @@ def fetch_market_data():
     tickers = [t.replace('.', '-') for t in tickers]
 
     temp_list = []
-    total = len(tickers)
     
+    # 웹용 프로그레스 바
     progress_bar = st.progress(0)
     status_text = st.empty()
+    total = len(tickers)
 
     for i, ticker in enumerate(tickers, 1):
+        time.sleep(0.1) # 💡 [차단 방지] 0.1초 쉬었다가 요청
         try:
-            s = yf.Ticker(ticker)
+            s = yf.Ticker(ticker, session=session)
             info = s.info
             hist = s.history(period="1y")
             if hist.empty or len(hist) < 22: continue
@@ -67,18 +65,15 @@ def fetch_market_data():
             ebitda_val = info.get('ebitda', 1.0)
             ie_val = info.get('interestExpense', 1.0) if info.get('interestExpense') not in [None, 0] else 1.0
             mcap = info.get('marketCap', 1) if info.get('marketCap') else 1
-            div_yield = float(info.get('dividendYield') or 0.0)
 
+            div_yield = float(info.get('dividendYield') or 0.0)
+            
             if track == 'FIN':
-                roe = info.get('returnOnEquity', 0)
-                hybrid_prf = float(roe) if roe else 0.0
+                hybrid_prf = float(info.get('returnOnEquity') or 0.0)
                 total_shareholder_yield = div_yield
-                
                 pe = info.get('trailingPE')
                 pb = info.get('priceToBook')
-                val_pe = 1 / float(pe) if pe and float(pe) > 0 else 0
-                val_pb = 1 / float(pb) if pb and float(pb) > 0 else 0
-                val_score = (val_pe * 0.5) + (val_pb * 0.5)
+                val_score = ((1/float(pe) if pe and float(pe) > 0 else 0)*0.5) + ((1/float(pb) if pb and float(pb) > 0 else 0)*0.5)
             else:
                 fcf = float(info.get('freeCashflow') or 0.0)
                 fcf_yield = fcf / mcap
@@ -94,8 +89,7 @@ def fetch_market_data():
                 else:
                     pe = info.get('forwardPE') or info.get('trailingPE')
                     val_peg = 1 / (float(pe) / 15) if pe and float(pe) > 0 else 0
-                val_pb = 1 / float(pb) if pb and float(pb) > 0 else 0
-                val_score = (val_peg * 0.7) + (val_pb * 0.3)
+                val_score = (val_peg * 0.7) + ((1/float(pb) if pb and float(pb) > 0 else 0)*0.3)
 
             rev_g = max(-0.5, min(0.5, float(info.get('revenueGrowth') or 0.0)))
             earn_g = max(-0.5, min(0.5, float(info.get('earningsGrowth') or 0.0)))
@@ -104,13 +98,18 @@ def fetch_market_data():
 
             temp_list.append({
                 '종목': ticker, '기업명': c_name, '섹터': sector, '트랙': track, 'PayoutRatio': payout_ratio,
-                'VAL': val_score, 'MOM': mom_score, 'GRW': grw_score, 
-                'PRF': hybrid_prf, 'YLD': total_shareholder_yield, 'DEBT': debt_to_asset, 'ICR': (ebitda_val / ie_val)
+                'VAL': val_score, 'MOM': mom_score, 'GRW': grw_score, 'PRF': hybrid_prf, 
+                'YLD': total_shareholder_yield, 'DEBT': debt_to_asset, 'ICR': (ebitda_val / ie_val)
             })
         except Exception: pass
         
-        progress_bar.progress(i / total)
-        status_text.text(f"마켓 데이터 수집 및 분석 중... ({i}/{total})")
+        # 프로그레스 바 업데이트
+        if i % 10 == 0 or i == total:
+            progress_bar.progress(i / total)
+            status_text.text(f"마켓 데이터 딥다이브 중... ({i}/{total})")
+
+    progress_bar.empty()
+    status_text.empty()
 
     df = pd.DataFrame(temp_list).replace([np.inf, -np.inf], 0).fillna(0)
     cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
@@ -139,21 +138,30 @@ def fetch_market_data():
     df['Base'] = (z_data['VAL']*0.15 + z_data['MOM']*0.15 + z_data['GRW']*0.20 + z_data['PRF']*0.20 + z_data['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
     df['최종점수'] = round(((df['Base'] - (-3.0)) / 6.0) * 100, 1).clip(0, 100)
     df['투자의견'] = df['최종점수'].apply(get_rating)
-    
+
     df['등급요약'] = [f"건전[{get_grade(z_hlt.iloc[i])}] 수익[{get_grade(z_data['PRF'].iloc[i])}] 성장[{get_grade(z_data['GRW'].iloc[i])}] 가치[{get_grade(z_data['VAL'].iloc[i])}] 모멘[{get_grade(z_data['MOM'].iloc[i])}] 환원[{get_grade(z_data['YLD'].iloc[i])}]" for i in range(len(df))]
 
     df = df.sort_values('최종점수', ascending=False).reset_index(drop=True)
     df.insert(0, '순위', range(1, len(df) + 1))
     
-    progress_bar.empty()
-    status_text.empty()
-    
     return df[['순위', '종목', '기업명', '최종점수', '투자의견', '섹터', '등급요약']], sector_stats, track_stats
 
-# --- 3. UI 화면 구성 (탭) ---
+# --- 3. 자동 로딩 및 글로벌 세션 ---
+if 'quant_data' not in st.session_state:
+    st.session_state['quant_data'] = None
+
+# 웹페이지 켜지면 무조건 자동으로 한 번 돌림 (캐싱 덕분에 두 번째 접속부터는 즉시 로딩)
+if st.session_state['quant_data'] is None:
+    with st.spinner("🔄 오늘의 마켓 데이터를 준비하고 있습니다 (최초 1회 약 3~4분 소요)..."):
+        df, sec_s, trk_s = fetch_market_data()
+        st.session_state['quant_data'] = df
+        st.session_state['sector_stats'] = sec_s
+        st.session_state['track_stats'] = trk_s
+
+# --- 4. 화면 UI ---
 st.title("🌶️ TeamChilly - SnowBall")
 
-tab1, tab2, tab3 = st.tabs(["📊 대시보드", "🏆 SnowBall TOP 100", "🔍 개별 종목 분석"])
+tab1, tab2, tab3 = st.tabs(["📊 대시보드", "🏆 SnowBall TOP 100", "🔍 개별 종목 딥다이브"])
 
 with tab1:
     st.subheader("📌 SnowBall 평가 지표 (Dual-Engine 적용)")
@@ -165,119 +173,119 @@ with tab1:
     * **🏷️ 가치:** [일반] PEG+P/B / [금융·리츠] P/E+P/B
     * **💰 환원율:** 주주 친화 정책 및 배당 함정(Yield Trap) 필터링
     """)
-    st.divider()
-    
-    # 💡 캐싱된 함수 호출로 변경
-    if st.button("🚀 S&P 900 실시간 데이터 수집 (최초 1회 약 5분 소요)", use_container_width=True):
-        with st.spinner("SnowBall 엔진 가동 중..."):
-            df, sec_s, trk_s = fetch_market_data()
-            st.session_state['quant_data'] = df
-            st.session_state['sector_stats'] = sec_s
-            st.session_state['track_stats'] = trk_s
-            st.success("✅ 수집 및 분석이 완료되었습니다! (24시간 동안 결과가 캐싱됩니다)")
-            time.sleep(2)
-            st.rerun()
+    st.info("✅ 데이터가 자동으로 최신화되어 캐싱 중입니다. 자유롭게 탭을 이동하며 분석을 즐겨주세요!")
 
 with tab2:
+    st.subheader("🏆 SnowBall 퀀트 랭킹")
     if st.session_state['quant_data'] is not None:
-        st.subheader("🏆 퀀트 랭킹 보드")
+        # 💡 [핵심] 촌스러운 텍스트 박스 대신, 세련되고 스크롤/정렬이 가능한 데이터프레임 표출
         st.dataframe(st.session_state['quant_data'].head(100), use_container_width=True, hide_index=True)
-    else:
-        st.info("대시보드에서 '실시간 데이터 수집' 버튼을 눌러주세요.")
 
 with tab3:
     st.subheader("🔍 개별 종목 실시간 진단")
-    ticker_input = st.text_input("분석할 티커를 입력하세요 (예: AAPL, NVDA)")
     
-    if st.button("진단 시작") and ticker_input:
-        if st.session_state['sector_stats'] is None:
-            st.error("⚠️ 기준 데이터가 없습니다. 대시보드에서 먼저 전체 수집을 진행해 주세요.")
-        else:
-            with st.spinner(f"'{ticker_input.upper()}' 종목을 뜯어보는 중입니다..."):
-                try:
-                    s = yf.Ticker(ticker_input.upper())
-                    info = s.info
-                    hist = s.history(period="1y")
+    # 💡 [핵심] 폼(Form) 적용으로 엔터키 완벽 지원
+    with st.form("search_form"):
+        ticker_input = st.text_input("분석할 티커 (예: AAPL, NVDA)")
+        submit_btn = st.form_submit_button("진단 시작")
+        
+    if submit_btn and ticker_input:
+        with st.spinner(f"'{ticker_input.upper()}' 종목을 뜯어보는 중입니다..."):
+            tk = ticker_input.upper().strip()
+            session = requests.Session()
+            session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+            
+            try:
+                s = yf.Ticker(tk, session=session)
+                info = s.info
+                hist = s.history(period="1y")
+                
+                if hist.empty or len(hist) < 22:
+                    st.error("❌ 상장 폐지되었거나 데이터가 부족한 종목입니다.")
+                else:
+                    sector = info.get('sector', 'Unknown')
+                    track = 'FIN' if sector in ['Financial Services', 'Real Estate'] else 'STD'
+                    c_name = info.get('shortName', tk)
                     
-                    if hist.empty or len(hist) < 22:
-                        st.error("❌ 상장 폐지되었거나 데이터가 부족한 종목입니다.")
+                    debt_eq = info.get('debtToEquity')
+                    debt_to_asset = (float(debt_eq) / 100.0) / (1 + float(debt_eq) / 100.0) * 100.0 if debt_eq and float(debt_eq) >= 0 else 100.0
+                    ie_val = info.get('interestExpense', 1.0) if info.get('interestExpense') not in [None, 0] else 1.0
+                    icr_val = info.get('ebitda', 1.0) / ie_val
+                    div_yield = float(info.get('dividendYield') or 0.0)
+                    
+                    if track == 'FIN':
+                        hybrid_prf = float(info.get('returnOnEquity') or 0.0)
+                        total_shareholder_yield = div_yield
+                        pe = info.get('trailingPE')
+                        pb = info.get('priceToBook')
+                        val_score = ((1/float(pe) if pe and float(pe)>0 else 0)*0.5) + ((1/float(pb) if pb and float(pb)>0 else 0)*0.5)
                     else:
-                        sector = info.get('sector', 'Unknown')
-                        track = 'FIN' if sector in ['Financial Services', 'Real Estate'] else 'STD'
-                        c_name = info.get('shortName', ticker_input.upper())
-                        
-                        debt_eq = info.get('debtToEquity')
-                        debt_to_asset = (float(debt_eq) / 100.0) / (1 + float(debt_eq) / 100.0) * 100.0 if debt_eq and float(debt_eq) >= 0 else 100.0
-                        ie_val = info.get('interestExpense', 1.0) if info.get('interestExpense') not in [None, 0] else 1.0
-                        icr_val = info.get('ebitda', 1.0) / ie_val
-                        div_yield = float(info.get('dividendYield') or 0.0)
-                        
-                        if track == 'FIN':
-                            hybrid_prf = float(info.get('returnOnEquity') or 0.0)
-                            total_shareholder_yield = div_yield
-                            pe = info.get('trailingPE')
-                            pb = info.get('priceToBook')
-                            val_score = ((1/float(pe) if pe and float(pe)>0 else 0)*0.5) + ((1/float(pb) if pb and float(pb)>0 else 0)*0.5)
+                        mcap = info.get('marketCap', 1) or 1
+                        fcf_yield = float(info.get('freeCashflow') or 0.0) / mcap
+                        total_shareholder_yield = div_yield + max(0, fcf_yield)
+                        hybrid_prf = (float(info.get('returnOnAssets') or 0.0)*0.5) + (float(info.get('operatingMargins') or 0.0)*0.5)
+                        peg = info.get('pegRatio')
+                        pb = info.get('priceToBook')
+                        if peg and float(peg) > 0: val_peg = 1 / float(peg)
                         else:
-                            mcap = info.get('marketCap', 1) or 1
-                            fcf_yield = float(info.get('freeCashflow') or 0.0) / mcap
-                            total_shareholder_yield = div_yield + max(0, fcf_yield)
-                            hybrid_prf = (float(info.get('returnOnAssets') or 0.0)*0.5) + (float(info.get('operatingMargins') or 0.0)*0.5)
-                            peg = info.get('pegRatio')
-                            pb = info.get('priceToBook')
-                            val_peg = 1/float(peg) if peg and float(peg)>0 else (1/(float(info.get('forwardPE', 0))/15) if info.get('forwardPE', 0) > 0 else 0)
-                            val_score = (val_peg * 0.7) + ((1/float(pb) if pb and float(pb)>0 else 0) * 0.3)
+                            pe = info.get('forwardPE') or info.get('trailingPE')
+                            val_peg = 1 / (float(pe) / 15) if pe and float(pe) > 0 else 0
+                        val_score = (val_peg * 0.7) + ((1/float(pb) if pb and float(pb)>0 else 0)*0.3)
 
-                        rev_g = max(-0.5, min(0.5, float(info.get('revenueGrowth') or 0.0)))
-                        earn_g = max(-0.5, min(0.5, float(info.get('earningsGrowth') or 0.0)))
-                        grw_score = (rev_g + earn_g) / 2
-                        mom_score = (hist['Close'].iloc[-21] / hist['Close'].iloc[0]) - 1
+                    rev_g = max(-0.5, min(0.5, float(info.get('revenueGrowth') or 0.0)))
+                    earn_g = max(-0.5, min(0.5, float(info.get('earningsGrowth') or 0.0)))
+                    grw_score = (rev_g + earn_g) / 2
+                    mom_score = (hist['Close'].iloc[-21] / hist['Close'].iloc[0]) - 1
 
-                        raw = {'VAL': val_score, 'MOM': mom_score, 'GRW': grw_score, 'PRF': hybrid_prf, 'YLD': total_shareholder_yield, 'DEBT': debt_to_asset, 'ICR': icr_val}
-                        sct_stats = st.session_state['sector_stats'].get(sector, st.session_state['sector_stats'][list(st.session_state['sector_stats'].keys())[0]])
-                        trk_stats = st.session_state['track_stats'].get(track, st.session_state['track_stats'][list(st.session_state['track_stats'].keys())[0]])
+                    raw = {'VAL': val_score, 'MOM': mom_score, 'GRW': grw_score, 'PRF': hybrid_prf, 'YLD': total_shareholder_yield, 'DEBT': debt_to_asset, 'ICR': icr_val}
+                    sct_stats = st.session_state['sector_stats'].get(sector, st.session_state['sector_stats'][list(st.session_state['sector_stats'].keys())[0]])
+                    trk_stats = st.session_state['track_stats'].get(track, st.session_state['track_stats'][list(st.session_state['track_stats'].keys())[0]])
 
-                        z_scores = {}
-                        for key in raw.keys():
-                            s_z = (raw[key] - sct_stats[key]['mean']) / (sct_stats[key]['std'] + 1e-9)
-                            t_z = (raw[key] - trk_stats[key]['mean']) / (trk_stats[key]['std'] + 1e-9)
-                            z = (s_z * 0.5 + t_z * 0.5) * (-1 if key == 'DEBT' else 1)
-                            z_scores[key] = max(-3.0, min(3.0, z))
+                    z_scores = {}
+                    for key in raw.keys():
+                        s_z = (raw[key] - sct_stats[key]['mean']) / (sct_stats[key]['std'] + 1e-9)
+                        t_z = (raw[key] - trk_stats[key]['mean']) / (trk_stats[key]['std'] + 1e-9)
+                        z = (s_z * 0.5 + t_z * 0.5) * (-1 if key == 'DEBT' else 1)
+                        z_scores[key] = max(-3.0, min(3.0, z))
 
-                        z_hlt = (z_scores['DEBT'] + z_scores['ICR']) / 2
-                        penalty = 0.15 * ((debt_to_asset/50)**2.5) if track == 'STD' and debt_to_asset >= 50 else 0
-                        payout_ratio = float(info.get('payoutRatio') or 0.0)
-                        trap_penalty = 2.0 if payout_ratio > 1.0 or payout_ratio < 0 else 0
+                    z_hlt = (z_scores['DEBT'] + z_scores['ICR']) / 2
+                    penalty = 0.15 * ((debt_to_asset/50)**2.5) if track == 'STD' and debt_to_asset >= 50 else 0
+                    payout_ratio = float(info.get('payoutRatio') or 0.0)
+                    trap_penalty = 2.0 if payout_ratio > 1.0 or payout_ratio < 0 else 0
 
-                        base = (z_scores['VAL']*0.15 + z_scores['MOM']*0.15 + z_scores['GRW']*0.20 + z_scores['PRF']*0.20 + z_scores['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
-                        final_score = round(max(0, min(100, ((base - (-3.0)) / 6.0) * 100)), 1)
-                        rating = get_rating(final_score)
+                    base = (z_scores['VAL']*0.15 + z_scores['MOM']*0.15 + z_scores['GRW']*0.20 + z_scores['PRF']*0.20 + z_scores['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
+                    final_score = round(max(0, min(100, ((base - (-3.0)) / 6.0) * 100)), 1)
+                    rating = get_rating(final_score)
 
-                        eval_scores = {'가치': z_scores['VAL'], '모멘텀': z_scores['MOM'], '성장성': z_scores['GRW'], '수익성': z_scores['PRF'], '환원율': z_scores['YLD'], '건전성': z_hlt}
-                        best_p = max(eval_scores, key=eval_scores.get)
-                        worst_p = min(eval_scores, key=eval_scores.get)
-                        
-                        if trap_penalty > 0: summ = "🚨 TeamChilly 경보! 번 돈보다 배당을 더 많이 주는 '배당 함정(Yield Trap)' 종목입니다. 절대 주의!"
-                        elif final_score >= 80: summ = "🔥 폼 미쳤다! 흠잡을 데 없는 완벽한 주식. 당장 포트에 안 담고 뭐하시나요?"
-                        elif final_score >= 60: summ = f"🛒 [{best_p}] 하나는 정말 기가 막히네요! [{worst_p}]만 눈감아준다면 든든한 국밥 같은 종목입니다."
-                        elif final_score >= 40: summ = f"⏸️ 음... 쏘쏘하네요. [{best_p}]은(는) 볼만하지만, [{worst_p}]이(가) 발목을 꽉 잡고 있습니다."
-                        elif final_score >= 20: summ = f"📉 굳이 이 주식을..? [{worst_p}] 상태를 보면 매수 버튼 누르던 손가락도 멈춰야 합니다."
-                        else: summ = f"🚨 TeamChilly 경보! [{worst_p}]이(가) 계좌를 살살 녹일 관상입니다. 뒤도 돌아보지 마세요!"
+                    eval_scores = {'가치': z_scores['VAL'], '모멘텀': z_scores['MOM'], '성장성': z_scores['GRW'], '수익성': z_scores['PRF'], '환원율': z_scores['YLD'], '건전성': z_hlt}
+                    best_p = max(eval_scores, key=eval_scores.get)
+                    worst_p = min(eval_scores, key=eval_scores.get)
+                    
+                    if trap_penalty > 0: summ = "🚨 TeamChilly 경보! 번 돈보다 배당을 더 많이 주는 '배당 함정(Yield Trap)' 종목입니다. 절대 주의!"
+                    elif final_score >= 80: summ = "🔥 폼 미쳤다! 흠잡을 데 없는 완벽한 주식. 당장 포트에 안 담고 뭐하시나요?"
+                    elif final_score >= 60: summ = f"🛒 [{best_p}] 하나는 정말 기가 막히네요! [{worst_p}]만 눈감아준다면 든든한 국밥 같은 종목입니다."
+                    elif final_score >= 40: summ = f"⏸️ 음... 쏘쏘하네요. [{best_p}]은(는) 볼만하지만, [{worst_p}]이(가) 발목을 꽉 잡고 있습니다."
+                    elif final_score >= 20: summ = f"📉 굳이 이 주식을..? [{worst_p}] 상태를 보면 매수 버튼 누르던 손가락도 멈춰야 합니다."
+                    else: summ = f"🚨 TeamChilly 경보! [{worst_p}]이(가) 계좌를 살살 녹일 관상입니다. 뒤도 돌아보지 마세요!"
 
-                        st.success(f"### {c_name} ({ticker_input.upper()}) : {final_score} 점 ({rating})")
-                        st.caption(f"섹터: {sector} | 유니버스: {'금융/리츠 트랙' if track=='FIN' else '스탠다드 트랙'}")
-                        st.info(summ)
-                        
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("🛡️ 건전성", get_grade(z_hlt))
-                        col2.metric("📈 수익성", get_grade(z_scores['PRF']))
-                        col3.metric("🚀 성장성", get_grade(z_scores['GRW']))
-                        col4, col5, col6 = st.columns(3)
-                        col4.metric("🏷️ 가치", get_grade(z_scores['VAL']))
-                        col5.metric("🏄 모멘텀", get_grade(z_scores['MOM']))
-                        col6.metric("💰 환원율", get_grade(z_scores['YLD']))
-                        
-                        if penalty > 0: st.warning(f"⚠️ 부채 위험에 따른 징벌적 감점 적용됨")
+                    st.success(f"### {c_name} ({tk}) : {final_score} 점 ({rating})")
+                    st.caption(f"섹터: {sector} | 유니버스: {'금융/리츠 트랙' if track=='FIN' else '스탠다드 트랙'}")
+                    st.info(f"💡 TeamChilly 총평: {summ}")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("🛡️ 건전성", get_grade(z_hlt))
+                    col2.metric("📈 수익성", get_grade(z_scores['PRF']))
+                    col3.metric("🚀 성장성", get_grade(z_scores['GRW']))
+                    col4, col5, col6 = st.columns(3)
+                    col4.metric("🏷️ 가치", get_grade(z_scores['VAL']))
+                    col5.metric("🏄 모멘텀", get_grade(z_scores['MOM']))
+                    col6.metric("💰 환원율", get_grade(z_scores['YLD']))
+                    
+                    if penalty > 0: st.warning(f"⚠️ 부채 위험에 따른 징벌적 감점 적용됨")
 
-                except Exception as e:
-                    st.error(f"오류가 발생했습니다: {e}")
+            except Exception as e:
+                # 💡 [버그 픽스] 야후 차단 에러 시 친절한 안내 문구 출력
+                if "429" in str(e) or "Rate limited" in str(e):
+                    st.error("🚨 야후 파이낸스 서버가 일시적으로 요청을 차단했습니다. 잠시 후 다시 시도해주세요.")
+                else:
+                    st.error(f"❌ 분석 실패: 데이터를 불러올 수 없습니다. 티커를 확인해주세요.")
