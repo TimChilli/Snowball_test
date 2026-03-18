@@ -177,7 +177,7 @@ if st.query_params.get("admin") == "chillixlaclffl":
 
 with st.sidebar:
     st.markdown("<br>"*20, unsafe_allow_html=True)
-    st.caption("powered by TeamChilly")
+    st.caption("powered by TeamChilli")
 
 if st.session_state['quant_data'] is None:
     with st.spinner("마켓 데이터를 준비하고 있습니다..."):
