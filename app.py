@@ -7,9 +7,32 @@ import io
 import time
 import datetime
 import pytz
+import os
+import pickle
 
 # --- 1. 페이지 및 기본 설정 ---
 st.set_page_config(page_title="SnowBall", page_icon="☃", layout="wide")
+
+SHARED_FILE = "snowball_shared_data.pkl"
+
+def save_global_data(df, sec_s, trk_s, updated_time):
+    data = {
+        'df': df,
+        'sec_s': sec_s,
+        'trk_s': trk_s,
+        'updated_time': updated_time
+    }
+    with open(SHARED_FILE, 'wb') as f:
+        pickle.dump(data, f)
+
+def load_global_data():
+    if os.path.exists(SHARED_FILE):
+        try:
+            with open(SHARED_FILE, 'rb') as f:
+                return pickle.load(f)
+        except:
+            return None
+    return None
 
 def get_grade(z):
     if z >= 1.0: return 'A'
@@ -33,7 +56,6 @@ def get_trade_day():
     return now.strftime('%Y-%m-%d')
 
 # --- 2. 자동 수집 함수 ---
-@st.cache_data(show_spinner=False)
 def fetch_market_data(trade_day):
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
@@ -164,53 +186,66 @@ def fetch_market_data(trade_day):
     
     return df, sector_stats, track_stats, update_time
 
-# --- 3. 세션 초기화 및 시크릿 접속 ---
-if 'quant_data' not in st.session_state: st.session_state['quant_data'] = None
-if 'sector_stats' not in st.session_state: st.session_state['sector_stats'] = None
-if 'track_stats' not in st.session_state: st.session_state['track_stats'] = None
-if 'last_updated' not in st.session_state: st.session_state['last_updated'] = "수집 전"
-if 'is_admin' not in st.session_state: st.session_state['is_admin'] = False
+# --- 3. 글로벌 세션 초기화 및 시크릿 접속 ---
+if 'quant_data' not in st.session_state: 
+    st.session_state['quant_data'] = None
+    st.session_state['sector_stats'] = None
+    st.session_state['track_stats'] = None
+    st.session_state['last_updated'] = "수집 전"
+    
+    # 💡 [핵심] 누구나 앱을 켜면 공용 하드디스크(Pickle)부터 확인합니다.
+    global_data = load_global_data()
+    if global_data is not None:
+        st.session_state['quant_data'] = global_data['df']
+        st.session_state['sector_stats'] = global_data['sec_s']
+        st.session_state['track_stats'] = global_data['trk_s']
+        st.session_state['last_updated'] = global_data['updated_time']
 
-# 오직 URL 파라미터로만 관리자 모드 진입 (사이드바 완전 제거)
+if 'is_admin' not in st.session_state: 
+    st.session_state['is_admin'] = False
+
 if st.query_params.get("admin") == "chillixlaclffl":
     st.session_state['is_admin'] = True
 
-# 💡 [핵심] 관리자와 일반 사용자의 최초 접속 화면 분리
 if st.session_state['quant_data'] is None:
     if st.session_state['is_admin']:
-        st.title("🛠️ SnowBall 관리자 초기 설정")
-        st.info("현재 서버 메모리에 로드된 마켓 데이터가 없습니다. 운영 방식을 선택해주세요.")
+        st.title("SnowBall 관리자 설정")
+        st.info("현재 로드된 공용 마켓 데이터가 없습니다. 데이터를 세팅해주세요.")
 
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("1️⃣ 신규 데이터 수집")
-            if st.button("🚀 야후 파이낸스 실시간 수집 시작", use_container_width=True):
-                with st.spinner("데이터 수집 엔진 가동 중... (약 3~5분 소요)"):
+            st.subheader("1. 신규 수집")
+            if st.button("야후 실시간 수집 시작", use_container_width=True):
+                with st.spinner("수집 엔진 가동 중..."):
                     try:
                         current_trade_day = get_trade_day()
                         df, sec_s, trk_s, updated_time = fetch_market_data(current_trade_day)
+                        save_global_data(df, sec_s, trk_s, updated_time) # 💡 공용 하드에 저장
                         st.session_state['quant_data'] = df
                         st.session_state['sector_stats'] = sec_s
                         st.session_state['track_stats'] = trk_s
                         st.session_state['last_updated'] = updated_time
                         st.rerun()
-                    except Exception as e:
-                        st.error("야후 파이낸스 서버 접근이 차단되었습니다 (Too Many Requests).")
-                        st.info("우측의 엑셀 백업 업로드를 이용해주세요.")
+                    except Exception:
+                        st.error("야후 서버 접근이 차단되었습니다.")
         
         with col2:
-            st.subheader("2️⃣ 백업 파일 업로드")
-            uploaded_file = st.file_uploader("📁 기존 엑셀/CSV 데이터 업로드", type=["xlsx", "csv"])
+            st.subheader("2. 백업 파일 업로드")
+            uploaded_file = st.file_uploader("기존 엑셀/CSV 업로드", type=["xlsx", "csv"])
             if uploaded_file is not None:
                 try:
                     df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
-                    if 'Z_HLT' not in df.columns: st.warning("주의: 구버전 형식이라 일부 기능 제약이 있을 수 있습니다.")
-                    st.session_state['quant_data'] = df
                     cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
-                    st.session_state['sector_stats'] = {sct: {c: {'mean': df[df['섹터']==sct][c].mean(), 'std': df[df['섹터']==sct][c].std()} for c in cols if c in df.columns} for sct in df['섹터'].unique()}
-                    st.session_state['track_stats'] = {trk: {c: {'mean': df[df['트랙']==trk][c].mean(), 'std': df[df['트랙']==trk][c].std()} for c in cols if c in df.columns} for trk in df['트랙'].unique()} if '트랙' in df.columns else {}
-                    st.session_state['last_updated'] = "수동 데이터 업로드 완료"
-                    st.success("데이터 로드 성공!")
+                    sec_s = {sct: {c: {'mean': df[df['섹터']==sct][c].mean(), 'std': df[df['섹터']==sct][c].std()} for c in cols if c in df.columns} for sct in df['섹터'].unique()}
+                    trk_s = {trk: {c: {'mean': df[df['트랙']==trk][c].mean(), 'std': df[df['트랙']==trk][c].std()} for c in cols if c in df.columns} for trk in df['트랙'].unique()} if '트랙' in df.columns else {}
+                    
+                    save_global_data(df, sec_s, trk_s, "수동 파일 동기화 완료") # 💡 공용 하드에 저장
+                    
+                    st.session_state['quant_data'] = df
+                    st.session_state['sector_stats'] = sec_s
+                    st.session_state['track_stats'] = trk_s
+                    st.session_state['last_updated'] = "수동 파일 동기화 완료"
+                    st.success("로드 성공! 글로벌 환경에 적용되었습니다.")
                     time.sleep(1)
                     st.rerun()
                 except Exception as e:
@@ -218,70 +253,74 @@ if st.session_state['quant_data'] is None:
         
         st.markdown("<br><br><br>", unsafe_allow_html=True)
         st.caption("powered by TeamChilli")
-        st.stop() # 관리자는 선택 전까지 메인 탭에 진입 불가
+        st.stop()
         
     else:
-        # 일반 사용자가 접속했는데 데이터가 없을 때
-        with st.spinner("마켓 데이터를 준비하고 있습니다 (매일 미국 프리장 오픈 시 갱신)..."):
-            try:
-                current_trade_day = get_trade_day()
-                df, sec_s, trk_s, updated_time = fetch_market_data(current_trade_day)
-                st.session_state['quant_data'] = df
-                st.session_state['sector_stats'] = sec_s
-                st.session_state['track_stats'] = trk_s
-                st.session_state['last_updated'] = updated_time
-                st.rerun()
-            except Exception:
-                st.error("🚨 현재 야후 파이낸스 통신망이 혼잡하여 자동 수집이 차단되었습니다.")
-                st.info("관리자가 곧 백업 데이터를 업데이트할 예정입니다. 잠시 후 다시 접속해 주세요.")
-                st.markdown("<br><br><br>", unsafe_allow_html=True)
-                st.caption("powered by TeamChilli")
-                st.stop()
-
+        st.info("관리자가 마켓 데이터를 준비하고 있습니다. 잠시 후 다시 접속해 주세요.")
+        st.markdown("<br><br><br>", unsafe_allow_html=True)
+        st.caption("powered by TeamChilli")
+        st.stop()
 
 # --- 4. 메인 화면 ---
 st.title("☃ SnowBall")
-st.caption(f"최근 데이터 동기화: {st.session_state['last_updated']} (매일 미국 프리장 오픈 시 갱신)")
+st.caption(f"최근 데이터 동기화: {st.session_state['last_updated']}")
 
 tab1, tab2, tab3 = st.tabs(["대시보드", "Snow Ball Quant TOP 100", "개별 종목 분석"])
 
 with tab1:
     st.subheader("SnowBall 평가 모델")
     st.markdown("""
-    * **건전성:** 재무적으로 얼마나 안정적인지 판단
-    * **수익성:** 얼마나 효율적으로 이익을 내는지를 판단
-    * **성장성:** 매출과 이익, 펀더멘털 확장성
-    * **모멘텀:** 시장의 중장기 트렌드 추세 판단
-    * **가성비:** 실적이나 자산에 대비한 값어치를 판단
-    * **환원율:** 주주에게 얼마나 적극적으로 이익을 돌려주는지를 판단
+    * **건전성** 재무적으로 얼마나 안정적인지 판단
+    * **수익성** 얼마나 효율적으로 이익을 내는지를 판단
+    * **성장성** 매출과 이익, 펀더멘털 확장성
+    * **모멘텀** 시장의 중장기 트렌드 추세 판단
+    * **가성비** 실적이나 자산에 대비한 값어치를 판단
+    * **환원율** 주주에게 얼마나 적극적으로 이익을 돌려주는지를 판단
     """)
     st.divider()
     
     if st.session_state['is_admin']:
-        st.markdown("### [관리자 전용] 데이터 컨트롤 패널")
+        st.markdown("### [관리자 전용] 데이터 갱신 패널")
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("강제 재수집 (캐시 초기화)", use_container_width=True):
-                st.cache_data.clear()
-                st.rerun()
+            if st.button("강제 재수집 (야후 API)", use_container_width=True):
+                try:
+                    current_trade_day = get_trade_day()
+                    df, sec_s, trk_s, updated_time = fetch_market_data(current_trade_day)
+                    save_global_data(df, sec_s, trk_s, updated_time)
+                    st.session_state['quant_data'] = df
+                    st.session_state['sector_stats'] = sec_s
+                    st.session_state['track_stats'] = trk_s
+                    st.session_state['last_updated'] = updated_time
+                    st.success("글로벌 데이터가 갱신되었습니다.")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception:
+                    st.error("야후 통신 실패")
+            
             if st.session_state['quant_data'] is not None:
                 csv_data = st.session_state['quant_data'].to_csv(index=False).encode('utf-8-sig')
-                st.download_button("현재 데이터 다운로드 (CSV)", data=csv_data, file_name=f"SnowBall_{datetime.datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
+                st.download_button("현재 데이터 다운로드", data=csv_data, file_name=f"SnowBall_{datetime.datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
         with col2:
             uploaded_file = st.file_uploader("백업 엑셀/CSV 수동 업로드", type=["xlsx", "csv"])
             if uploaded_file is not None:
                 try:
                     df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
-                    if 'Z_HLT' not in df.columns: st.warning("주의: 업로드된 데이터가 구버전 형식이라 기능 제약이 있을 수 있습니다.")
+                    cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
+                    sec_s = {sct: {c: {'mean': df[df['섹터']==sct][c].mean(), 'std': df[df['섹터']==sct][c].std()} for c in cols if c in df.columns} for sct in df['섹터'].unique()}
+                    trk_s = {trk: {c: {'mean': df[df['트랙']==trk][c].mean(), 'std': df[df['트랙']==trk][c].std()} for c in cols if c in df.columns} for trk in df['트랙'].unique()} if '트랙' in df.columns else {}
+                    
+                    save_global_data(df, sec_s, trk_s, "수동 파일 동기화 완료")
+                    
                     st.session_state['quant_data'] = df
-                    st.session_state['last_updated'] = "수동 데이터 업로드 완료"
-                    st.success("데이터 로드 성공!")
+                    st.session_state['sector_stats'] = sec_s
+                    st.session_state['track_stats'] = trk_s
+                    st.session_state['last_updated'] = "수동 파일 동기화 완료"
+                    st.success("데이터 로드 성공! 손님들에게 즉시 노출됩니다.")
                     time.sleep(1)
                     st.rerun()
                 except Exception as e:
                     st.error(f"업로드 에러: {e}")
-    else:
-        st.info("데이터가 캐싱되어 작동 중입니다. 탭을 이동하며 분석 결과를 확인하세요.")
 
 with tab2:
     st.subheader("🏆 Snow Ball Quant TOP 100")
@@ -335,7 +374,6 @@ with tab3:
                 worst_p = min(eval_scores, key=eval_scores.get)
                 
                 trap_penalty = row.get('TrapPenalty', 0)
-                penalty = row.get('Penalty', 0)
                 
                 if trap_penalty > 0: summ = "배당 함정(Yield Trap) 종목입니다. 절대 주의하세요."
                 elif final_score >= 80: summ = "흠잡을 데 없는 완벽한 수치입니다."
@@ -357,20 +395,18 @@ with tab3:
                 col5.metric("모멘텀", row['모멘텀'])
                 col6.metric("환원율", row['환원율'])
                 
-                if penalty > 0: st.warning("부채 위험에 따른 징벌적 감점 적용됨")
-                
         else:
-            st.warning(f"'{tk}'는 S&P 900 목록에 없어 야후 파이낸스 실시간 수집을 시도합니다.")
-            with st.spinner("실시간 수집 중..."):
+            st.warning(f"'{tk}'는 S&P 900 목록에 없어 실시간 수집을 시도합니다.")
+            with st.spinner("수집 중..."):
                 try:
                     s = yf.Ticker(tk)
                     info = s.info
                     hist = s.history(period="1y")
                     
                     if hist.empty or len(hist) < 22:
-                        st.error(f"[{tk}] 데이터 부족 또는 상장폐지 종목입니다.")
+                        st.error("데이터 부족 또는 상장폐지 종목입니다.")
                     elif 'sector' not in info and 'currentPrice' not in info:
-                        st.error(f"[{tk}] ETF 또는 재무 데이터 미제공 종목입니다.")
+                        st.error("ETF 또는 재무 데이터 미제공 종목입니다.")
                     else:
                         sector = info.get('sector', 'Unknown')
                         track = 'FIN' if sector in ['Financial Services', 'Real Estate'] else 'STD'
@@ -411,57 +447,50 @@ with tab3:
                         sct_stats = st.session_state.get('sector_stats')
                         trk_stats = st.session_state.get('track_stats')
                         
-                        if not sct_stats or not trk_stats:
-                            st.error("기준 데이터가 없어 상대 평가를 진행할 수 없습니다.")
-                        else:
-                            s_stat = sct_stats.get(sector, sct_stats[list(sct_stats.keys())[0]])
-                            t_stat = trk_stats.get(track, trk_stats[list(trk_stats.keys())[0]])
+                        s_stat = sct_stats.get(sector, sct_stats[list(sct_stats.keys())[0]])
+                        t_stat = trk_stats.get(track, trk_stats[list(trk_stats.keys())[0]])
 
-                            z_scores = {}
-                            for key in raw.keys():
-                                s_z = (raw[key] - s_stat[key]['mean']) / (s_stat[key]['std'] + 1e-9)
-                                t_z = (raw[key] - t_stat[key]['mean']) / (t_stat[key]['std'] + 1e-9)
-                                z = (s_z * 0.5 + t_z * 0.5) * (-1 if key == 'DEBT' else 1)
-                                z_scores[key] = max(-3.0, min(3.0, z))
+                        z_scores = {}
+                        for key in raw.keys():
+                            s_z = (raw[key] - s_stat[key]['mean']) / (s_stat[key]['std'] + 1e-9)
+                            t_z = (raw[key] - t_stat[key]['mean']) / (t_stat[key]['std'] + 1e-9)
+                            z = (s_z * 0.5 + t_z * 0.5) * (-1 if key == 'DEBT' else 1)
+                            z_scores[key] = max(-3.0, min(3.0, z))
 
-                            z_hlt = (z_scores['DEBT'] + z_scores['ICR']) / 2
-                            penalty = 0.15 * ((debt_to_asset/50)**2.5) if track == 'STD' and debt_to_asset >= 50 else 0
-                            payout_ratio = float(info.get('payoutRatio') or 0.0)
-                            trap_penalty = 2.0 if payout_ratio > 1.0 or payout_ratio < 0 else 0
+                        z_hlt = (z_scores['DEBT'] + z_scores['ICR']) / 2
+                        penalty = 0.15 * ((debt_to_asset/50)**2.5) if track == 'STD' and debt_to_asset >= 50 else 0
+                        payout_ratio = float(info.get('payoutRatio') or 0.0)
+                        trap_penalty = 2.0 if payout_ratio > 1.0 or payout_ratio < 0 else 0
 
-                            base = (z_scores['VAL']*0.15 + z_scores['MOM']*0.15 + z_scores['GRW']*0.20 + z_scores['PRF']*0.20 + z_scores['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
-                            final_score = round(max(0, min(100, ((base - (-3.0)) / 6.0) * 100)), 1)
-                            
-                            eval_scores = {'가성비': z_scores['VAL'], '모멘텀': z_scores['MOM'], '성장성': z_scores['GRW'], '수익성': z_scores['PRF'], '환원율': z_scores['YLD'], '건전성': z_hlt}
-                            best_p = max(eval_scores, key=eval_scores.get)
-                            worst_p = min(eval_scores, key=eval_scores.get)
-                            
-                            if trap_penalty > 0: summ = "배당 함정(Yield Trap) 종목입니다. 절대 주의하세요."
-                            elif final_score >= 80: summ = "흠잡을 데 없는 완벽한 수치입니다."
-                            elif final_score >= 60: summ = f"[{best_p}] 지표가 훌륭합니다. [{worst_p}] 지표만 유의하시면 안정적인 종목입니다."
-                            elif final_score >= 40: summ = f"무난한 수준입니다. [{best_p}] 지표는 긍정적이나 [{worst_p}] 지표 확인이 필요합니다."
-                            elif final_score >= 20: summ = f"[{worst_p}] 지표가 심각하여 매수에 주의가 필요합니다."
-                            else: summ = f"[{worst_p}] 지표 등 전반적인 상태가 매우 부진합니다."
+                        base = (z_scores['VAL']*0.15 + z_scores['MOM']*0.15 + z_scores['GRW']*0.20 + z_scores['PRF']*0.20 + z_scores['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
+                        final_score = round(max(0, min(100, ((base - (-3.0)) / 6.0) * 100)), 1)
+                        
+                        eval_scores = {'가성비': z_scores['VAL'], '모멘텀': z_scores['MOM'], '성장성': z_scores['GRW'], '수익성': z_scores['PRF'], '환원율': z_scores['YLD'], '건전성': z_hlt}
+                        best_p = max(eval_scores, key=eval_scores.get)
+                        worst_p = min(eval_scores, key=eval_scores.get)
+                        
+                        if trap_penalty > 0: summ = "배당 함정(Yield Trap) 종목입니다. 절대 주의하세요."
+                        elif final_score >= 80: summ = "흠잡을 데 없는 완벽한 수치입니다."
+                        elif final_score >= 60: summ = f"[{best_p}] 지표가 훌륭합니다. [{worst_p}] 지표만 유의하시면 안정적인 종목입니다."
+                        elif final_score >= 40: summ = f"무난한 수준입니다. [{best_p}] 지표는 긍정적이나 [{worst_p}] 지표 확인이 필요합니다."
+                        elif final_score >= 20: summ = f"[{worst_p}] 지표가 심각하여 매수에 주의가 필요합니다."
+                        else: summ = f"[{worst_p}] 지표 등 전반적인 상태가 매우 부진합니다."
 
-                            st.success(f"### {c_name} ({tk}) : {final_score} 점 ({get_rating(final_score)})")
-                            st.caption(f"섹터: {sector} | 유니버스: {'금융/리츠 트랙' if track=='FIN' else '스탠다드 트랙'} (실시간 수집)")
-                            st.info(f"총평: {summ}")
-                            
-                            col1, col2, col3 = st.columns(3)
-                            col1.metric("건전성", get_grade(z_hlt))
-                            col2.metric("수익성", get_grade(z_scores['PRF']))
-                            col3.metric("성장성", get_grade(z_scores['GRW']))
-                            col4, col5, col6 = st.columns(3)
-                            col4.metric("가성비", get_grade(z_scores['VAL']))
-                            col5.metric("모멘텀", get_grade(z_scores['MOM']))
-                            col6.metric("환원율", get_grade(z_scores['YLD']))
-                            
-                            if penalty > 0: st.warning("부채 위험에 따른 징벌적 감점 적용됨")
+                        st.success(f"### {c_name} ({tk}) : {final_score} 점 ({get_rating(final_score)})")
+                        st.caption(f"섹터: {sector} | 유니버스: {'금융/리츠 트랙' if track=='FIN' else '스탠다드 트랙'} (실시간 수집)")
+                        st.info(f"총평: {summ}")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        col1.metric("건전성", get_grade(z_hlt))
+                        col2.metric("수익성", get_grade(z_scores['PRF']))
+                        col3.metric("성장성", get_grade(z_scores['GRW']))
+                        col4, col5, col6 = st.columns(3)
+                        col4.metric("가성비", get_grade(z_scores['VAL']))
+                        col5.metric("모멘텀", get_grade(z_scores['MOM']))
+                        col6.metric("환원율", get_grade(z_scores['YLD']))
 
-                except Exception as e:
-                    if "429" in str(e) or "Rate limited" in str(e): st.error("야후 서버가 일시적으로 요청을 차단했습니다.")
-                    else: st.error(f"분석 실패: 티커를 다시 확인해 주세요.")
+                except Exception:
+                    st.error("야후 서버 통신에 실패했습니다.")
 
-# 페이지 최하단에 작게 제작사 고정 (사이드바 대신)
 st.markdown("<br><br><br>", unsafe_allow_html=True)
 st.caption("powered by TeamChilli")
