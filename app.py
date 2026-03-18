@@ -235,7 +235,7 @@ if st.session_state['quant_data'] is None:
                 st.error("🚨 현재 야후 파이낸스 통신망이 혼잡하여 자동 수집이 차단되었습니다.")
                 st.info("관리자가 곧 백업 데이터를 업데이트할 예정입니다. 잠시 후 다시 접속해 주세요.")
                 st.markdown("<br><br><br>", unsafe_allow_html=True)
-                st.caption("powered by TeamChilly")
+                st.caption("powered by TeamChilli")
                 st.stop()
 
 
@@ -464,4 +464,4 @@ with tab3:
 
 # 페이지 최하단에 작게 제작사 고정 (사이드바 대신)
 st.markdown("<br><br><br>", unsafe_allow_html=True)
-st.caption("powered by TeamChilly")
+st.caption("powered by TeamChilli")
