@@ -6,9 +6,10 @@ import requests
 import io
 import time
 import datetime
+import pytz
 
 # --- 1. 페이지 및 기본 설정 ---
-st.set_page_config(page_title="SnowBall", page_icon="🌶️", layout="wide")
+st.set_page_config(page_title="SnowBall", page_icon="⛄︎", layout="wide")
 
 def get_grade(z):
     if z >= 1.0: return 'A'
@@ -24,9 +25,19 @@ def get_rating(score):
     elif score >= 20: return 'Sell'
     else: return 'Strong Sell'
 
-# --- 2. 자동 수집 및 캐싱 (24시간 유지) ---
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_market_data():
+# 💡 [핵심] 미국 동부 시간(EST) 기준 프리장 오픈(새벽 4시)을 감지하는 함수
+def get_trade_day():
+    tz = pytz.timezone('US/Eastern')
+    now = datetime.datetime.now(tz)
+    # 새벽 4시 이전이면 어제 날짜를, 4시 이후면 오늘 날짜를 반환
+    if now.hour < 4:
+        return (now - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+    return now.strftime('%Y-%m-%d')
+
+# --- 2. 자동 수집 및 캐싱 (프리장 기준 갱신) ---
+# 매개변수(trade_day)가 바뀔 때만 캐시를 무시하고 새로 수집합니다.
+@st.cache_data(show_spinner=False)
+def fetch_market_data(trade_day):
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
     
@@ -87,8 +98,6 @@ def fetch_market_data():
             rev_g = max(-0.5, min(0.5, float(info.get('revenueGrowth') or 0.0)))
             earn_g = max(-0.5, min(0.5, float(info.get('earningsGrowth') or 0.0)))
             grw_score = (rev_g + earn_g) / 2
-            
-            # 💡 [핵심] 12M-1M 모멘텀 (Mean Reversion 방지)
             mom_score = (hist['Close'].iloc[-21] / hist['Close'].iloc[0]) - 1
 
             temp_list.append({
@@ -100,7 +109,7 @@ def fetch_market_data():
         
         if i % 10 == 0 or i == total:
             progress_bar.progress(i / total)
-            status_text.text(f"데이터 수집 중... ({i}/{total})")
+            status_text.text(f"마켓 데이터 수집 중... ({i}/{total})")
 
     progress_bar.empty()
     status_text.empty()
@@ -141,50 +150,55 @@ def fetch_market_data():
     df = df.sort_values('최종점수', ascending=False).reset_index(drop=True)
     df.insert(0, '순위', range(1, len(df) + 1))
     
-    return df[['순위', '종목', '기업명', '최종점수', '투자의견', '섹터', '등급요약']], sector_stats, track_stats
+    # 한국 시간 기준으로 갱신 시간 기록
+    kst = pytz.timezone('Asia/Seoul')
+    update_time = datetime.datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S KST')
+    
+    return df[['순위', '종목', '기업명', '최종점수', '투자의견', '섹터', '등급요약']], sector_stats, track_stats, update_time
 
-# --- 3. 세션 초기화 및 사이드바 (Admin 숨김) ---
+# --- 3. 세션 초기화 및 시크릿 URL 관리자 모드 ---
 if 'quant_data' not in st.session_state:
     st.session_state['quant_data'] = None
 if 'sector_stats' not in st.session_state:
     st.session_state['sector_stats'] = None
 if 'track_stats' not in st.session_state:
     st.session_state['track_stats'] = None
-if 'is_admin' not in st.session_state:
+if 'last_updated' not in st.session_state:
+    st.session_state['last_updated'] = "수집 전"
+
+# 💡 [핵심] URL 파라미터로 관리자 메뉴 숨기기 (화면엔 아무것도 안 나옴)
+# 사용 방법: 웹사이트 주소 뒤에 /?admin=chillitmwmzl!@#0 을 붙여서 접속!
+if "admin" in st.query_params and st.query_params["admin"] == "chillitmwmzl!@#0":
+    st.session_state['is_admin'] = True
+else:
     st.session_state['is_admin'] = False
 
 with st.sidebar:
-    # 💡 [핵심] 제작사 표기를 눈에 띄지 않게 하단 배치
     st.markdown("<br><br><br><br><br><br><br><br>", unsafe_allow_html=True)
     st.caption("powered by TeamChilli")
-    
-    # 💡 [핵심] 아무도 모르게 숨겨진 관리자 메뉴
-    with st.expander("🔑"):
-        admin_pw = st.text_input("Admin Code", type="password")
-        if admin_pw == "chilly2026":
-            st.session_state['is_admin'] = True
-            st.success("Admin 모드 활성")
-        elif admin_pw != "":
-            st.session_state['is_admin'] = False
 
 if st.session_state['quant_data'] is None:
-    with st.spinner("🔄 오늘의 마켓 데이터를 로딩 중입니다..."):
+    with st.spinner("🔄 마켓 데이터를 준비하고 있습니다 (프리장 기준 최신화 중)..."):
         try:
-            df, sec_s, trk_s = fetch_market_data()
+            current_trade_day = get_trade_day()
+            df, sec_s, trk_s, updated_time = fetch_market_data(current_trade_day)
             st.session_state['quant_data'] = df
             st.session_state['sector_stats'] = sec_s
             st.session_state['track_stats'] = trk_s
+            st.session_state['last_updated'] = updated_time
             st.rerun()
         except Exception as e:
-            st.error(f"🚨 서버 통신 실패 (야후 차단). 운영자에게 문의하세요.")
+            st.error(f"서버 통신 실패 (야후 차단). 운영자에게 문의하세요.")
 
 # --- 4. 메인 화면 ---
 st.title("❄️ SnowBall")
+# 💡 [핵심] 갱신 시간을 작게 공지
+st.caption(f"⏳ 최근 데이터 동기화: {st.session_state['last_updated']} (매일 미국 프리장 오픈 시 자동 갱신)")
 
 tab1, tab2, tab3 = st.tabs(["📊 대시보드", "🏆 SnowBall TOP 100", "🔍 개별 종목 분석"])
 
 with tab1:
-    st.subheader("📌 SnowBall 6-Pillar 평가 모델")
+    st.subheader("📌 SnowBall 평가 모델")
     st.markdown("""
     * **🛡️ 건전성:** 재무 리스크 방어력 (D/A, 이자보상배율)
     * **📈 수익성:** [일반] ROA+영업이익률 / [금융·리츠] ROE
@@ -195,18 +209,19 @@ with tab1:
     """)
     st.divider()
     
+    # 💡 시크릿 URL로 접속한 관리자에게만 보이는 메뉴
     if st.session_state['is_admin']:
-        st.markdown("### 🛠️ 관리자 패널")
+        st.markdown("### 🛠️ [관리자 전용] 데이터 컨트롤 패널")
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("강제 재수집 (캐시 초기화)", use_container_width=True):
+            if st.button("🚀 강제 재수집 (캐시 초기화)", use_container_width=True):
                 st.cache_data.clear()
                 st.rerun()
             if st.session_state['quant_data'] is not None:
                 csv_data = st.session_state['quant_data'].to_csv(index=False).encode('utf-8-sig')
-                st.download_button("💾 현재 데이터 내보내기", data=csv_data, file_name=f"SnowBall_{datetime.datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
+                st.download_button("💾 현재 데이터 다운로드 (CSV)", data=csv_data, file_name=f"SnowBall_{datetime.datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
         with col2:
-            uploaded_file = st.file_uploader("📁 엑셀/CSV 수동 업로드", type=["xlsx", "csv"])
+            uploaded_file = st.file_uploader("📁 백업 엑셀/CSV 수동 업로드 (야후 차단 시)", type=["xlsx", "csv"])
             if uploaded_file is not None:
                 try:
                     df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
@@ -214,18 +229,18 @@ with tab1:
                     cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
                     st.session_state['sector_stats'] = {sct: {c: {'mean': df[df['섹터']==sct][c].mean(), 'std': df[df['섹터']==sct][c].std()} for c in cols if c in df.columns} for sct in df['섹터'].unique()}
                     st.session_state['track_stats'] = {trk: {c: {'mean': df[df['트랙']==trk][c].mean(), 'std': df[df['트랙']==trk][c].std()} for c in cols if c in df.columns} for trk in df['트랙'].unique()} if '트랙' in df.columns else {}
-                    st.success("데이터 로드 성공!")
+                    st.session_state['last_updated'] = "수동 엑셀 업로드 완료"
+                    st.success("수동 데이터 로드 성공!")
                     time.sleep(1)
                     st.rerun()
                 except Exception as e:
                     st.error(f"업로드 에러: {e}")
     else:
-        st.info("✅ 데이터가 자동으로 최신화되어 캐싱 중입니다. 탭을 이동하며 분석을 확인하세요.")
+        st.info("✅ 6-Pillar 엔진이 백그라운드에서 캐싱되어 작동 중입니다. 탭을 이동하며 분석 결과를 확인하세요.")
 
 with tab2:
     st.subheader("🏆 SnowBall 퀀트 랭킹")
     if st.session_state['quant_data'] is not None:
-        # 💡 [핵심] 컬럼 크기를 강제 지정하여 UI를 타이트하게 고정
         st.dataframe(
             st.session_state['quant_data'].head(100),
             use_container_width=True,
