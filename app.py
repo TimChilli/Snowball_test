@@ -9,7 +9,7 @@ import datetime
 import pytz
 
 # --- 1. 페이지 및 기본 설정 ---
-st.set_page_config(page_title="SnowBall", page_icon="⛄︎", layout="wide")
+st.set_page_config(page_title="SnowBall", page_icon="☃", layout="wide")
 
 def get_grade(z):
     if z >= 1.0: return 'A'
@@ -25,17 +25,14 @@ def get_rating(score):
     elif score >= 20: return 'Sell'
     else: return 'Strong Sell'
 
-# 💡 [핵심] 미국 동부 시간(EST) 기준 프리장 오픈(새벽 4시)을 감지하는 함수
 def get_trade_day():
     tz = pytz.timezone('US/Eastern')
     now = datetime.datetime.now(tz)
-    # 새벽 4시 이전이면 어제 날짜를, 4시 이후면 오늘 날짜를 반환
     if now.hour < 4:
         return (now - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
     return now.strftime('%Y-%m-%d')
 
-# --- 2. 자동 수집 및 캐싱 (프리장 기준 갱신) ---
-# 매개변수(trade_day)가 바뀔 때만 캐시를 무시하고 새로 수집합니다.
+# --- 2. 자동 수집 함수 ---
 @st.cache_data(show_spinner=False)
 def fetch_market_data(trade_day):
     session = requests.Session()
@@ -109,13 +106,13 @@ def fetch_market_data(trade_day):
         
         if i % 10 == 0 or i == total:
             progress_bar.progress(i / total)
-            status_text.text(f"마켓 데이터 수집 중... ({i}/{total})")
+            status_text.text(f"데이터 수집 중... ({i}/{total})")
 
     progress_bar.empty()
     status_text.empty()
 
     if len(temp_list) == 0:
-        raise ValueError("야후 파이낸스 서버 접속 차단 (Too Many Requests).")
+        raise ValueError("야후 파이낸스 서버 접속 차단")
 
     df = pd.DataFrame(temp_list).replace([np.inf, -np.inf], 0).fillna(0)
     cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
@@ -150,35 +147,36 @@ def fetch_market_data(trade_day):
     df = df.sort_values('최종점수', ascending=False).reset_index(drop=True)
     df.insert(0, '순위', range(1, len(df) + 1))
     
-    # 한국 시간 기준으로 갱신 시간 기록
     kst = pytz.timezone('Asia/Seoul')
     update_time = datetime.datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S KST')
     
     return df[['순위', '종목', '기업명', '최종점수', '투자의견', '섹터', '등급요약']], sector_stats, track_stats, update_time
 
-# --- 3. 세션 초기화 및 시크릿 URL 관리자 모드 ---
-if 'quant_data' not in st.session_state:
-    st.session_state['quant_data'] = None
-if 'sector_stats' not in st.session_state:
-    st.session_state['sector_stats'] = None
-if 'track_stats' not in st.session_state:
-    st.session_state['track_stats'] = None
-if 'last_updated' not in st.session_state:
-    st.session_state['last_updated'] = "수집 전"
+# --- 3. 세션 초기화 및 관리자 모드 ---
+if 'quant_data' not in st.session_state: st.session_state['quant_data'] = None
+if 'sector_stats' not in st.session_state: st.session_state['sector_stats'] = None
+if 'track_stats' not in st.session_state: st.session_state['track_stats'] = None
+if 'last_updated' not in st.session_state: st.session_state['last_updated'] = "수집 전"
+if 'is_admin' not in st.session_state: st.session_state['is_admin'] = False
 
-# 💡 [핵심] URL 파라미터로 관리자 메뉴 숨기기 (화면엔 아무것도 안 나옴)
-# 사용 방법: 웹사이트 주소 뒤에 /?admin=chillitmwmzl!@#0 을 붙여서 접속!
-if "admin" in st.query_params and st.query_params["admin"] == "chillitmwmzl!@#0":
+# URL 파라미터 체크
+if st.query_params.get("admin") == "chilli2026":
     st.session_state['is_admin'] = True
-else:
-    st.session_state['is_admin'] = False
 
 with st.sidebar:
-    st.markdown("<br><br><br><br><br><br><br><br>", unsafe_allow_html=True)
+    st.markdown("<br>"*15, unsafe_allow_html=True)
+    
+    # 투명한 공간(공백)을 눌러야 열리는 완벽히 숨겨진 관리자 암호 입력칸
+    with st.expander(" ", expanded=False): 
+        admin_pw = st.text_input("Admin Code", type="password", label_visibility="collapsed")
+        if admin_pw == "chilli2026":
+            st.session_state['is_admin'] = True
+            st.success("Admin 모드 활성")
+
     st.caption("powered by TeamChilli")
 
 if st.session_state['quant_data'] is None:
-    with st.spinner("🔄 마켓 데이터를 준비하고 있습니다 (프리장 기준 최신화 중)..."):
+    with st.spinner("마켓 데이터를 준비하고 있습니다..."):
         try:
             current_trade_day = get_trade_day()
             df, sec_s, trk_s, updated_time = fetch_market_data(current_trade_day)
@@ -187,41 +185,40 @@ if st.session_state['quant_data'] is None:
             st.session_state['track_stats'] = trk_s
             st.session_state['last_updated'] = updated_time
             st.rerun()
-        except Exception as e:
-            st.error(f"서버 통신 실패 (야후 차단). 운영자에게 문의하세요.")
+        except Exception:
+            st.error("야후 파이낸스 서버 접근이 차단되었습니다 (Too Many Requests).")
+            st.info("관리자 모드로 접속하여 로컬에서 추출한 백업 데이터를 업로드해주세요.")
 
 # --- 4. 메인 화면 ---
-st.title("❄️ SnowBall")
-# 💡 [핵심] 갱신 시간을 작게 공지
-st.caption(f"⏳ 최근 데이터 동기화: {st.session_state['last_updated']} (매일 미국 프리장 오픈 시 자동 갱신)")
+st.title("☃ SnowBall")
+st.caption(f"최근 데이터 동기화: {st.session_state['last_updated']} (매일 미국 프리장 오픈 시 갱신)")
 
-tab1, tab2, tab3 = st.tabs(["📊 대시보드", "🏆 SnowBall TOP 100", "🔍 개별 종목 분석"])
+tab1, tab2, tab3 = st.tabs(["대시보드", "SnowBall TOP 100", "개별 종목 분석"])
 
 with tab1:
-    st.subheader("📌 SnowBall 평가 모델")
+    st.subheader("SnowBall 6-Pillar 평가 모델")
     st.markdown("""
-    * **🛡️ 건전성:** 재무 리스크 방어력 (D/A, 이자보상배율)
-    * **📈 수익성:** [일반] ROA+영업이익률 / [금융·리츠] ROE
-    * **🚀 성장성:** 펀더멘털 확장성 (매출 및 이익 성장률)
-    * **🏄 모멘텀:** 시장의 중장기 트렌드 추세 (12개월)
-    * **🏷️ 가치:** [일반] PEG+P/B / [금융·리츠] P/E+P/B
-    * **💰 환원율:** 주주 친화 정책 및 잉여현금흐름
+    * **건전성:** 재무 리스크 방어력 (D/A, 이자보상배율)
+    * **수익성:** [일반] ROA+영업이익률 / [금융·리츠] ROE
+    * **성장성:** 펀더멘털 확장성 (매출 및 이익 성장률)
+    * **모멘텀:** 시장의 중장기 트렌드 추세 (12개월)
+    * **가치:** [일반] PEG+P/B / [금융·리츠] P/E+P/B
+    * **환원율:** 주주 친화 정책 및 잉여현금흐름
     """)
     st.divider()
     
-    # 💡 시크릿 URL로 접속한 관리자에게만 보이는 메뉴
     if st.session_state['is_admin']:
-        st.markdown("### 🛠️ [관리자 전용] 데이터 컨트롤 패널")
+        st.markdown("### [관리자 전용] 데이터 컨트롤 패널")
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("🚀 강제 재수집 (캐시 초기화)", use_container_width=True):
+            if st.button("강제 재수집 (캐시 초기화)", use_container_width=True):
                 st.cache_data.clear()
                 st.rerun()
             if st.session_state['quant_data'] is not None:
                 csv_data = st.session_state['quant_data'].to_csv(index=False).encode('utf-8-sig')
-                st.download_button("💾 현재 데이터 다운로드 (CSV)", data=csv_data, file_name=f"SnowBall_{datetime.datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
+                st.download_button("현재 데이터 다운로드 (CSV)", data=csv_data, file_name=f"SnowBall_{datetime.datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
         with col2:
-            uploaded_file = st.file_uploader("📁 백업 엑셀/CSV 수동 업로드 (야후 차단 시)", type=["xlsx", "csv"])
+            uploaded_file = st.file_uploader("백업 엑셀/CSV 수동 업로드", type=["xlsx", "csv"])
             if uploaded_file is not None:
                 try:
                     df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
@@ -229,17 +226,17 @@ with tab1:
                     cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
                     st.session_state['sector_stats'] = {sct: {c: {'mean': df[df['섹터']==sct][c].mean(), 'std': df[df['섹터']==sct][c].std()} for c in cols if c in df.columns} for sct in df['섹터'].unique()}
                     st.session_state['track_stats'] = {trk: {c: {'mean': df[df['트랙']==trk][c].mean(), 'std': df[df['트랙']==trk][c].std()} for c in cols if c in df.columns} for trk in df['트랙'].unique()} if '트랙' in df.columns else {}
-                    st.session_state['last_updated'] = "수동 엑셀 업로드 완료"
-                    st.success("수동 데이터 로드 성공!")
+                    st.session_state['last_updated'] = "수동 데이터 업로드 완료"
+                    st.success("데이터 로드 성공!")
                     time.sleep(1)
                     st.rerun()
                 except Exception as e:
                     st.error(f"업로드 에러: {e}")
     else:
-        st.info("✅ 6-Pillar 엔진이 백그라운드에서 캐싱되어 작동 중입니다. 탭을 이동하며 분석 결과를 확인하세요.")
+        st.info("데이터가 캐싱되어 작동 중입니다. 탭을 이동하며 분석 결과를 확인하세요.")
 
 with tab2:
-    st.subheader("🏆 SnowBall 퀀트 랭킹")
+    st.subheader("SnowBall 퀀트 랭킹")
     if st.session_state['quant_data'] is not None:
         st.dataframe(
             st.session_state['quant_data'].head(100),
@@ -257,16 +254,16 @@ with tab2:
         )
 
 with tab3:
-    st.subheader("🔍 개별 종목 분석")
+    st.subheader("개별 종목 분석")
     with st.form("search_form"):
         ticker_input = st.text_input("분석할 티커 (예: AAPL)")
         submit_btn = st.form_submit_button("분석 시작")
         
     if submit_btn and ticker_input:
         if st.session_state['sector_stats'] is None:
-            st.error("⚠️ 기준 데이터가 없습니다.")
+            st.error("기준 데이터가 없습니다. 엑셀 데이터를 업로드해주세요.")
         else:
-            with st.spinner(f"분석 중..."):
+            with st.spinner("분석 중..."):
                 tk = ticker_input.upper().strip()
                 session = requests.Session()
                 session.headers.update({'User-Agent': 'Mozilla/5.0'})
@@ -276,9 +273,9 @@ with tab3:
                     hist = s.history(period="1y")
                     
                     if hist.empty or len(hist) < 22:
-                        st.error(f"❌ [{tk}] 데이터 부족 또는 상장폐지 종목입니다.")
+                        st.error(f"[{tk}] 데이터 부족 또는 상장폐지 종목입니다.")
                     elif 'sector' not in info and 'currentPrice' not in info:
-                        st.error(f"❌ [{tk}] ETF 또는 재무 데이터 미제공 종목입니다.")
+                        st.error(f"[{tk}] ETF 또는 재무 데이터 미제공 종목입니다.")
                     else:
                         sector = info.get('sector', 'Unknown')
                         track = 'FIN' if sector in ['Financial Services', 'Real Estate'] else 'STD'
@@ -333,34 +330,32 @@ with tab3:
                         base = (z_scores['VAL']*0.15 + z_scores['MOM']*0.15 + z_scores['GRW']*0.20 + z_scores['PRF']*0.20 + z_scores['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
                         final_score = round(max(0, min(100, ((base - (-3.0)) / 6.0) * 100)), 1)
                         
-                        rating_icon = "🔥" if final_score >= 80 else "🛒" if final_score >= 60 else "⏸️" if final_score >= 40 else "📉" if final_score >= 20 else "🚨"
-
                         eval_scores = {'가치': z_scores['VAL'], '모멘텀': z_scores['MOM'], '성장성': z_scores['GRW'], '수익성': z_scores['PRF'], '환원율': z_scores['YLD'], '건전성': z_hlt}
                         best_p = max(eval_scores, key=eval_scores.get)
                         worst_p = min(eval_scores, key=eval_scores.get)
                         
-                        if trap_penalty > 0: summ = "🚨 번 돈보다 배당을 더 많이 주는 '배당 함정(Yield Trap)' 종목입니다. 절대 주의!"
-                        elif final_score >= 80: summ = "🔥 흠잡을 데 없는 완벽한 주식. 당장 포트에 담으세요!"
-                        elif final_score >= 60: summ = f"🛒 [{best_p}] 하나는 정말 기가 막히네요! [{worst_p}]만 눈감아준다면 든든한 국밥 같은 종목입니다."
-                        elif final_score >= 40: summ = f"⏸️ 쏘쏘하네요. [{best_p}]은(는) 좋지만, [{worst_p}]이(가) 발목을 꽉 잡고 있습니다."
-                        elif final_score >= 20: summ = f"📉 [{worst_p}] 상태를 보면 매수 버튼 누르던 손가락도 멈춰야 합니다."
-                        else: summ = f"🚨 [{worst_p}]이(가) 계좌를 살살 녹일 관상입니다. 피하세요!"
+                        if trap_penalty > 0: summ = "배당 함정(Yield Trap) 종목입니다. 절대 주의하세요."
+                        elif final_score >= 80: summ = "흠잡을 데 없는 완벽한 수치입니다."
+                        elif final_score >= 60: summ = f"[{best_p}] 지표가 훌륭합니다. [{worst_p}] 지표만 유의하시면 안정적인 종목입니다."
+                        elif final_score >= 40: summ = f"무난한 수준입니다. [{best_p}] 지표는 긍정적이나 [{worst_p}] 지표 확인이 필요합니다."
+                        elif final_score >= 20: summ = f"[{worst_p}] 지표가 심각하여 매수에 주의가 필요합니다."
+                        else: summ = f"[{worst_p}] 지표 등 전반적인 상태가 매우 부진합니다."
 
-                        st.success(f"### {c_name} ({tk}) : {final_score} 점 ({rating_icon} {get_rating(final_score)})")
+                        st.success(f"### {c_name} ({tk}) : {final_score} 점 ({get_rating(final_score)})")
                         st.caption(f"섹터: {sector} | 유니버스: {'금융/리츠 트랙' if track=='FIN' else '스탠다드 트랙'}")
-                        st.info(f"💡 총평: {summ}")
+                        st.info(f"총평: {summ}")
                         
                         col1, col2, col3 = st.columns(3)
-                        col1.metric("🛡️ 건전성", get_grade(z_hlt))
-                        col2.metric("📈 수익성", get_grade(z_scores['PRF']))
-                        col3.metric("🚀 성장성", get_grade(z_scores['GRW']))
+                        col1.metric("건전성", get_grade(z_hlt))
+                        col2.metric("수익성", get_grade(z_scores['PRF']))
+                        col3.metric("성장성", get_grade(z_scores['GRW']))
                         col4, col5, col6 = st.columns(3)
-                        col4.metric("🏷️ 가치", get_grade(z_scores['VAL']))
-                        col5.metric("🏄 모멘텀", get_grade(z_scores['MOM']))
-                        col6.metric("💰 환원율", get_grade(z_scores['YLD']))
+                        col4.metric("가치", get_grade(z_scores['VAL']))
+                        col5.metric("모멘텀", get_grade(z_scores['MOM']))
+                        col6.metric("환원율", get_grade(z_scores['YLD']))
                         
-                        if penalty > 0: st.warning(f"⚠️ 부채 위험에 따른 징벌적 감점 적용됨")
+                        if penalty > 0: st.warning("부채 위험에 따른 징벌적 감점 적용됨")
 
                 except Exception as e:
-                    if "429" in str(e) or "Rate limited" in str(e): st.error("🚨 야후 서버가 일시적으로 요청을 차단했습니다.")
-                    else: st.error(f"❌ 분석 실패: 티커를 다시 확인해 주세요.")
+                    if "429" in str(e) or "Rate limited" in str(e): st.error("야후 서버가 일시적으로 요청을 차단했습니다.")
+                    else: st.error(f"분석 실패: 티커를 다시 확인해 주세요.")
