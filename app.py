@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import requests
 import io
+import time # 💡 에러 원인 해결: time 도구 가져오기
 
 # --- 1. 페이지 기본 설정 ---
 st.set_page_config(page_title="TeamChilly - SnowBall", page_icon="🌶️", layout="wide")
@@ -22,7 +23,6 @@ def get_rating(score):
     elif score >= 20: return '📉 Sell'
     else: return '🚨 Strong Sell'
 
-# 세션 상태 초기화 (데이터 날아감 방지)
 if 'quant_data' not in st.session_state:
     st.session_state['quant_data'] = None
 if 'sector_stats' not in st.session_state:
@@ -30,17 +30,17 @@ if 'sector_stats' not in st.session_state:
 if 'track_stats' not in st.session_state:
     st.session_state['track_stats'] = None
 
-# --- 2. 데이터 수집 핵심 로직 ---
-def fetch_all_data():
+# 💡 [핵심] 캐싱 적용: 86400초(24시간) 동안 한 번 수집한 데이터를 기억합니다.
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_market_data():
     headers = {'User-Agent': 'Mozilla/5.0'}
     def get_t(url):
         res = requests.get(url, headers=headers)
         df = pd.read_html(io.StringIO(res.text))[0]
         return df['Symbol' if 'Symbol' in df.columns else 'Ticker symbol'].tolist()
     
-    with st.spinner('S&P 900 티커 목록을 가져오는 중입니다...'):
-        tickers = list(set(get_t('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies') + get_t('https://en.wikipedia.org/wiki/List_of_S%26P_400_companies')))
-        tickers = [t.replace('.', '-') for t in tickers]
+    tickers = list(set(get_t('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies') + get_t('https://en.wikipedia.org/wiki/List_of_S%26P_400_companies')))
+    tickers = [t.replace('.', '-') for t in tickers]
 
     temp_list = []
     total = len(tickers)
@@ -145,19 +145,15 @@ def fetch_all_data():
     df = df.sort_values('최종점수', ascending=False).reset_index(drop=True)
     df.insert(0, '순위', range(1, len(df) + 1))
     
-    # 세션에 저장 (브라우저 새로고침 전까지 유지)
-    st.session_state['quant_data'] = df[['순위', '종목', '기업명', '최종점수', '투자의견', '섹터', '등급요약']]
-    st.session_state['sector_stats'] = sector_stats
-    st.session_state['track_stats'] = track_stats
+    progress_bar.empty()
+    status_text.empty()
     
-    status_text.text("✅ 분석 완료!")
-    time.sleep(2)
-    st.rerun()
+    return df[['순위', '종목', '기업명', '최종점수', '투자의견', '섹터', '등급요약']], sector_stats, track_stats
 
 # --- 3. UI 화면 구성 (탭) ---
 st.title("🌶️ TeamChilly - SnowBall")
 
-tab1, tab2, tab3 = st.tabs(["📊 대시보드", "🏆 SnowBall TOP 100", "🔍 개별 종목 딥다이브"])
+tab1, tab2, tab3 = st.tabs(["📊 대시보드", "🏆 SnowBall TOP 100", "🔍 개별 종목 분석"])
 
 with tab1:
     st.subheader("📌 SnowBall 평가 지표 (Dual-Engine 적용)")
@@ -170,16 +166,24 @@ with tab1:
     * **💰 환원율:** 주주 친화 정책 및 배당 함정(Yield Trap) 필터링
     """)
     st.divider()
-    if st.button("🚀 S&P 900 실시간 딥다이브 시작 (약 5분 소요)", use_container_width=True):
-        fetch_all_data()
+    
+    # 💡 캐싱된 함수 호출로 변경
+    if st.button("🚀 S&P 900 실시간 데이터 수집 (최초 1회 약 5분 소요)", use_container_width=True):
+        with st.spinner("SnowBall 엔진 가동 중..."):
+            df, sec_s, trk_s = fetch_market_data()
+            st.session_state['quant_data'] = df
+            st.session_state['sector_stats'] = sec_s
+            st.session_state['track_stats'] = trk_s
+            st.success("✅ 수집 및 분석이 완료되었습니다! (24시간 동안 결과가 캐싱됩니다)")
+            time.sleep(2)
+            st.rerun()
 
 with tab2:
     if st.session_state['quant_data'] is not None:
         st.subheader("🏆 퀀트 랭킹 보드")
-        # 웹 브라우저에 맞게 아주 깔끔한 데이터프레임 표출
         st.dataframe(st.session_state['quant_data'].head(100), use_container_width=True, hide_index=True)
     else:
-        st.info("대시보드에서 '실시간 딥다이브 시작' 버튼을 눌러 데이터를 수집해 주세요.")
+        st.info("대시보드에서 '실시간 데이터 수집' 버튼을 눌러주세요.")
 
 with tab3:
     st.subheader("🔍 개별 종목 실시간 진단")
@@ -190,7 +194,6 @@ with tab3:
             st.error("⚠️ 기준 데이터가 없습니다. 대시보드에서 먼저 전체 수집을 진행해 주세요.")
         else:
             with st.spinner(f"'{ticker_input.upper()}' 종목을 뜯어보는 중입니다..."):
-                # 검색 로직은 S&P 900 수집 로직과 동일하게 단일 종목 처리 (생략 없이 컴팩트하게 구성)
                 try:
                     s = yf.Ticker(ticker_input.upper())
                     info = s.info
@@ -203,7 +206,6 @@ with tab3:
                         track = 'FIN' if sector in ['Financial Services', 'Real Estate'] else 'STD'
                         c_name = info.get('shortName', ticker_input.upper())
                         
-                        # 지표 계산 (수집부와 100% 동일)
                         debt_eq = info.get('debtToEquity')
                         debt_to_asset = (float(debt_eq) / 100.0) / (1 + float(debt_eq) / 100.0) * 100.0 if debt_eq and float(debt_eq) >= 0 else 100.0
                         ie_val = info.get('interestExpense', 1.0) if info.get('interestExpense') not in [None, 0] else 1.0
@@ -251,7 +253,6 @@ with tab3:
                         final_score = round(max(0, min(100, ((base - (-3.0)) / 6.0) * 100)), 1)
                         rating = get_rating(final_score)
 
-                        # 평가 멘트 생성
                         eval_scores = {'가치': z_scores['VAL'], '모멘텀': z_scores['MOM'], '성장성': z_scores['GRW'], '수익성': z_scores['PRF'], '환원율': z_scores['YLD'], '건전성': z_hlt}
                         best_p = max(eval_scores, key=eval_scores.get)
                         worst_p = min(eval_scores, key=eval_scores.get)
