@@ -217,7 +217,7 @@ if st.session_state['quant_data'] is None:
                     st.error(f"업로드 에러: {e}")
         
         st.markdown("<br><br><br>", unsafe_allow_html=True)
-        st.caption("powered by TeamChilly")
+        st.caption("powered by TeamChilli")
         st.stop() # 관리자는 선택 전까지 메인 탭에 진입 불가
         
     else:
