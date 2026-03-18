@@ -35,7 +35,6 @@ def get_trade_day():
 # --- 2. 자동 수집 함수 ---
 @st.cache_data(show_spinner=False)
 def fetch_market_data(trade_day):
-    # 위키피디아 S&P 900 목록 긁어올 때만 브라우저 위장 사용
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
     
@@ -55,7 +54,6 @@ def fetch_market_data(trade_day):
     for i, ticker in enumerate(tickers, 1):
         time.sleep(0.1) 
         try:
-            # 💡 [버그 픽스] session 파라미터 삭제 (야후 파이낸스 순정 통신)
             s = yf.Ticker(ticker)
             info = s.info
             hist = s.history(period="1y")
@@ -108,7 +106,8 @@ def fetch_market_data(trade_day):
         
         if i % 10 == 0 or i == total:
             progress_bar.progress(i / total)
-            status_text.text(f"데이터 수집 중... ({i}/{total})")
+            # 💡 [버그 픽스] 진행률 텍스트 더 직관적으로 표시
+            status_text.text(f"⏳ 데이터 수집 및 분석 중... ({i}/{total})")
 
     progress_bar.empty()
     status_text.empty()
@@ -178,7 +177,8 @@ with st.sidebar:
     st.caption("powered by TeamChilli")
 
 if st.session_state['quant_data'] is None:
-    with st.spinner("마켓 데이터를 준비하고 있습니다..."):
+    # 💡 [버그 픽스] 스피너 메시지에 소요 시간 명확히 안내
+    with st.spinner("🔄 오늘의 마켓 데이터를 준비하고 있습니다 (최초 1회 약 3~5분 소요)..."):
         try:
             current_trade_day = get_trade_day()
             df, sec_s, trk_s, updated_time = fetch_market_data(current_trade_day)
@@ -268,7 +268,6 @@ with tab3:
             with st.spinner("분석 중..."):
                 tk = ticker_input.upper().strip()
                 try:
-                    # 💡 [버그 픽스] 개별 종목 탭에서도 session 파라미터 삭제!
                     s = yf.Ticker(tk)
                     info = s.info
                     hist = s.history(period="1y")
