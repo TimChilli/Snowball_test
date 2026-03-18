@@ -167,7 +167,8 @@ def fetch_market_data(trade_day):
         penalty.append(p)
         trap_penalty.append(t_p)
 
-    df['Base'] = (z_data['VAL']*0.15 + z_data['MOM']*0.15 + z_data['GRW']*0.20 + z_data['PRF']*0.20 + z_data['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
+    # 💡 [핵심] 가성비 20%, 모멘텀 15%, 건전성 20%, 수익성 20%, 성장성 15%, 환원율 10%
+    df['Base'] = (z_data['VAL']*0.20 + z_data['MOM']*0.15 + z_data['GRW']*0.15 + z_data['PRF']*0.20 + z_data['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
     df['최종점수'] = round(((df['Base'] - (-3.0)) / 6.0) * 100, 1).clip(0, 100)
     df['투자의견'] = df['최종점수'].apply(get_rating)
 
@@ -193,7 +194,6 @@ if 'quant_data' not in st.session_state:
     st.session_state['track_stats'] = None
     st.session_state['last_updated'] = "수집 전"
     
-    # 💡 [핵심] 누구나 앱을 켜면 공용 하드디스크(Pickle)부터 확인합니다.
     global_data = load_global_data()
     if global_data is not None:
         st.session_state['quant_data'] = global_data['df']
@@ -220,7 +220,7 @@ if st.session_state['quant_data'] is None:
                     try:
                         current_trade_day = get_trade_day()
                         df, sec_s, trk_s, updated_time = fetch_market_data(current_trade_day)
-                        save_global_data(df, sec_s, trk_s, updated_time) # 💡 공용 하드에 저장
+                        save_global_data(df, sec_s, trk_s, updated_time)
                         st.session_state['quant_data'] = df
                         st.session_state['sector_stats'] = sec_s
                         st.session_state['track_stats'] = trk_s
@@ -239,7 +239,7 @@ if st.session_state['quant_data'] is None:
                     sec_s = {sct: {c: {'mean': df[df['섹터']==sct][c].mean(), 'std': df[df['섹터']==sct][c].std()} for c in cols if c in df.columns} for sct in df['섹터'].unique()}
                     trk_s = {trk: {c: {'mean': df[df['트랙']==trk][c].mean(), 'std': df[df['트랙']==trk][c].std()} for c in cols if c in df.columns} for trk in df['트랙'].unique()} if '트랙' in df.columns else {}
                     
-                    save_global_data(df, sec_s, trk_s, "수동 파일 동기화 완료") # 💡 공용 하드에 저장
+                    save_global_data(df, sec_s, trk_s, "수동 파일 동기화 완료")
                     
                     st.session_state['quant_data'] = df
                     st.session_state['sector_stats'] = sec_s
@@ -252,13 +252,13 @@ if st.session_state['quant_data'] is None:
                     st.error(f"업로드 에러: {e}")
         
         st.markdown("<br><br><br>", unsafe_allow_html=True)
-        st.caption("powered by TeamChilli")
+        st.caption("powered by garden")
         st.stop()
         
     else:
         st.info("관리자가 마켓 데이터를 준비하고 있습니다. 잠시 후 다시 접속해 주세요.")
         st.markdown("<br><br><br>", unsafe_allow_html=True)
-        st.caption("powered by TeamChilli")
+        st.caption("powered by garden")
         st.stop()
 
 # --- 4. 메인 화면 ---
@@ -462,7 +462,8 @@ with tab3:
                         payout_ratio = float(info.get('payoutRatio') or 0.0)
                         trap_penalty = 2.0 if payout_ratio > 1.0 or payout_ratio < 0 else 0
 
-                        base = (z_scores['VAL']*0.15 + z_scores['MOM']*0.15 + z_scores['GRW']*0.20 + z_scores['PRF']*0.20 + z_scores['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
+                        # 💡 [핵심] 가성비 20%, 모멘텀 15%, 건전성 20%, 수익성 20%, 성장성 15%, 환원율 10%
+                        base = (z_scores['VAL']*0.20 + z_scores['MOM']*0.15 + z_scores['GRW']*0.15 + z_scores['PRF']*0.20 + z_scores['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
                         final_score = round(max(0, min(100, ((base - (-3.0)) / 6.0) * 100)), 1)
                         
                         eval_scores = {'가성비': z_scores['VAL'], '모멘텀': z_scores['MOM'], '성장성': z_scores['GRW'], '수익성': z_scores['PRF'], '환원율': z_scores['YLD'], '건전성': z_hlt}
@@ -493,4 +494,4 @@ with tab3:
                     st.error("야후 서버 통신에 실패했습니다.")
 
 st.markdown("<br><br><br>", unsafe_allow_html=True)
-st.caption("powered by TeamChilli")
+st.caption("powered by garden")
