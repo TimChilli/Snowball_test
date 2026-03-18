@@ -35,6 +35,7 @@ def get_trade_day():
 # --- 2. 자동 수집 함수 ---
 @st.cache_data(show_spinner=False)
 def fetch_market_data(trade_day):
+    # 위키피디아 S&P 900 목록 긁어올 때만 브라우저 위장 사용
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
     
@@ -54,7 +55,8 @@ def fetch_market_data(trade_day):
     for i, ticker in enumerate(tickers, 1):
         time.sleep(0.1) 
         try:
-            s = yf.Ticker(ticker, session=session)
+            # 💡 [버그 픽스] session 파라미터 삭제 (야후 파이낸스 순정 통신)
+            s = yf.Ticker(ticker)
             info = s.info
             hist = s.history(period="1y")
             if hist.empty or len(hist) < 22: continue
@@ -112,7 +114,7 @@ def fetch_market_data(trade_day):
     status_text.empty()
 
     if len(temp_list) == 0:
-        raise ValueError("야후 파이낸스 서버 접속 차단")
+        raise ValueError("야후 파이낸스 서버 접속 차단 (Too Many Requests).")
 
     df = pd.DataFrame(temp_list).replace([np.inf, -np.inf], 0).fillna(0)
     cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
@@ -166,7 +168,7 @@ if st.query_params.get("admin") == "chilli2026":
 with st.sidebar:
     st.markdown("<br>"*15, unsafe_allow_html=True)
     
-    # 투명한 공간(공백)을 눌러야 열리는 완벽히 숨겨진 관리자 암호 입력칸
+    # 투명한 공간을 눌러야 열리는 관리자 암호 입력칸
     with st.expander(" ", expanded=False): 
         admin_pw = st.text_input("Admin Code", type="password", label_visibility="collapsed")
         if admin_pw == "chilli2026":
@@ -265,10 +267,9 @@ with tab3:
         else:
             with st.spinner("분석 중..."):
                 tk = ticker_input.upper().strip()
-                session = requests.Session()
-                session.headers.update({'User-Agent': 'Mozilla/5.0'})
                 try:
-                    s = yf.Ticker(tk, session=session)
+                    # 💡 [버그 픽스] 개별 종목 탭에서도 session 파라미터 삭제!
+                    s = yf.Ticker(tk)
                     info = s.info
                     hist = s.history(period="1y")
                     
