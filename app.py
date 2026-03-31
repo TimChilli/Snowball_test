@@ -117,7 +117,12 @@ def fetch_market_data(trade_day):
             rev_g = max(-0.5, min(0.5, float(info.get('revenueGrowth') or 0.0)))
             earn_g = max(-0.5, min(0.5, float(info.get('earningsGrowth') or 0.0)))
             grw_score = (rev_g + earn_g) / 2
-            mom_score = (hist['Close'].iloc[-21] / hist['Close'].iloc[0]) - 1
+            
+            # 💡 [엔진 업그레이드] 모멘텀 팩터 수술: 과거 12M-1M 에서 -> 최근 6개월(126일) 직관적 추세로 교체
+            if len(hist) >= 126:
+                mom_score = (hist['Close'].iloc[-1] / hist['Close'].iloc[-126]) - 1
+            else:
+                mom_score = (hist['Close'].iloc[-1] / hist['Close'].iloc[0]) - 1
 
             temp_list.append({
                 '종목': ticker, '기업명': c_name, '섹터': sector, '트랙': track, 'PayoutRatio': payout_ratio,
@@ -167,7 +172,6 @@ def fetch_market_data(trade_day):
         penalty.append(p)
         trap_penalty.append(t_p)
 
-    # 💡 [핵심] 가성비 20%, 모멘텀 15%, 건전성 20%, 수익성 20%, 성장성 15%, 환원율 10%
     df['Base'] = (z_data['VAL']*0.20 + z_data['MOM']*0.15 + z_data['GRW']*0.15 + z_data['PRF']*0.20 + z_data['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
     df['최종점수'] = round(((df['Base'] - (-3.0)) / 6.0) * 100, 1).clip(0, 100)
     df['투자의견'] = df['최종점수'].apply(get_rating)
@@ -252,13 +256,13 @@ if st.session_state['quant_data'] is None:
                     st.error(f"업로드 에러: {e}")
         
         st.markdown("<br><br><br>", unsafe_allow_html=True)
-        st.caption("powered by garden")
+        st.caption("powered by TeamChilli")
         st.stop()
         
     else:
         st.info("관리자가 마켓 데이터를 준비하고 있습니다. 잠시 후 다시 접속해 주세요.")
         st.markdown("<br><br><br>", unsafe_allow_html=True)
-        st.caption("powered by garden")
+        st.caption("powered by TeamChilli")
         st.stop()
 
 # --- 4. 메인 화면 ---
@@ -440,7 +444,12 @@ with tab3:
                         rev_g = max(-0.5, min(0.5, float(info.get('revenueGrowth') or 0.0)))
                         earn_g = max(-0.5, min(0.5, float(info.get('earningsGrowth') or 0.0)))
                         grw_score = (rev_g + earn_g) / 2
-                        mom_score = (hist['Close'].iloc[-21] / hist['Close'].iloc[0]) - 1
+                        
+                        # 💡 [실시간 검색 엔진도 6개월 모멘텀으로 업그레이드]
+                        if len(hist) >= 126:
+                            mom_score = (hist['Close'].iloc[-1] / hist['Close'].iloc[-126]) - 1
+                        else:
+                            mom_score = (hist['Close'].iloc[-1] / hist['Close'].iloc[0]) - 1
 
                         raw = {'VAL': val_score, 'MOM': mom_score, 'GRW': grw_score, 'PRF': hybrid_prf, 'YLD': total_shareholder_yield, 'DEBT': debt_to_asset, 'ICR': icr_val}
                         
@@ -462,7 +471,6 @@ with tab3:
                         payout_ratio = float(info.get('payoutRatio') or 0.0)
                         trap_penalty = 2.0 if payout_ratio > 1.0 or payout_ratio < 0 else 0
 
-                        # 💡 [핵심] 가성비 20%, 모멘텀 15%, 건전성 20%, 수익성 20%, 성장성 15%, 환원율 10%
                         base = (z_scores['VAL']*0.20 + z_scores['MOM']*0.15 + z_scores['GRW']*0.15 + z_scores['PRF']*0.20 + z_scores['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
                         final_score = round(max(0, min(100, ((base - (-3.0)) / 6.0) * 100)), 1)
                         
@@ -494,4 +502,4 @@ with tab3:
                     st.error("야후 서버 통신에 실패했습니다.")
 
 st.markdown("<br><br><br>", unsafe_allow_html=True)
-st.caption("powered by garden")
+st.caption("powered by TeamChilli")
