@@ -164,4 +164,3 @@ with tab3:
             st.error(f"'{tk}'는 DB에 없거나 순현금 분석 대상이 아닙니다. (현재 S&P 1500만 조회 가능)")
 
 st.markdown("<br><br><br><div style='text-align: center; color: #888; font-size: 12px;'>powered by TeamChilli</div>", unsafe_allow_html=True)
-```
