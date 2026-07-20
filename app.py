@@ -10,18 +10,12 @@ import pytz
 import os
 import pickle
 
-# --- 1. 페이지 및 기본 설정 ---
-st.set_page_config(page_title="SnowBall", page_icon="☃", layout="wide")
+st.set_page_config(page_title="Lynch's Net Cash", page_icon="💰", layout="wide")
 
-SHARED_FILE = "snowball_shared_data.pkl"
+SHARED_FILE = "lynch_shared_data.pkl"
 
-def save_global_data(df, sec_s, trk_s, updated_time):
-    data = {
-        'df': df,
-        'sec_s': sec_s,
-        'trk_s': trk_s,
-        'updated_time': updated_time
-    }
+def save_global_data(df, updated_time):
+    data = {'df': df, 'updated_time': updated_time}
     with open(SHARED_FILE, 'wb') as f:
         pickle.dump(data, f)
 
@@ -30,336 +24,112 @@ def load_global_data():
         try:
             with open(SHARED_FILE, 'rb') as f:
                 return pickle.load(f)
-        except:
-            return None
+        except: return None
     return None
-
-def get_grade(z):
-    if z >= 1.0: return 'A'
-    elif z >= 0.3: return 'B'
-    elif z >= -0.3: return 'C'
-    elif z >= -1.0: return 'D'
-    else: return 'F'
-
-def get_rating(score):
-    if score >= 80: return 'Strong Buy'
-    elif score >= 60: return 'Buy'
-    elif score >= 40: return 'Hold'
-    elif score >= 20: return 'Sell'
-    else: return 'Strong Sell'
 
 def get_trade_day():
     tz = pytz.timezone('US/Eastern')
     now = datetime.datetime.now(tz)
-    if now.hour < 4:
-        return (now - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+    if now.hour < 4: return (now - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
     return now.strftime('%Y-%m-%d')
 
-# --- 2. 자동 수집 함수 ---
-def fetch_market_data(trade_day):
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-    
-    def get_t(url):
-        res = requests.get(url, headers=session.headers)
-        df = pd.read_html(io.StringIO(res.text))[0]
-        return df['Symbol' if 'Symbol' in df.columns else 'Ticker symbol'].tolist()
-    
-    tickers = list(set(get_t('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies') + get_t('https://en.wikipedia.org/wiki/List_of_S%26P_400_companies')))
-    tickers = [t.replace('.', '-') for t in tickers]
-
-    temp_list = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    total = len(tickers)
-
-    for i, ticker in enumerate(tickers, 1):
-        time.sleep(0.1) 
-        try:
-            s = yf.Ticker(ticker)
-            info = s.info
-            hist = s.history(period="1y")
-            if hist.empty or len(hist) < 22: continue
-            if 'sector' not in info and 'currentPrice' not in info: continue
-            
-            c_name = info.get('shortName', info.get('longName', ticker))
-            sector = info.get('sector', 'Unknown')
-            track = 'FIN' if sector in ['Financial Services', 'Real Estate'] else 'STD'
-            
-            payout_ratio = float(info.get('payoutRatio') or 0.0)
-            debt_eq = info.get('debtToEquity')
-            debt_to_asset = (float(debt_eq) / 100.0) / (1 + float(debt_eq) / 100.0) * 100.0 if debt_eq and float(debt_eq) >= 0 else 100.0
-            ebitda_val = info.get('ebitda', 1.0)
-            ie_val = info.get('interestExpense', 1.0) if info.get('interestExpense') not in [None, 0] else 1.0
-            mcap = info.get('marketCap', 1) if info.get('marketCap') else 1
-            div_yield = float(info.get('dividendYield') or 0.0)
-            
-            if track == 'FIN':
-                hybrid_prf = float(info.get('returnOnEquity') or 0.0)
-                total_shareholder_yield = div_yield
-                pe = info.get('trailingPE')
-                pb = info.get('priceToBook')
-                val_score = ((1/float(pe) if pe and float(pe) > 0 else 0)*0.5) + ((1/float(pb) if pb and float(pb) > 0 else 0)*0.5)
-            else:
-                fcf = float(info.get('freeCashflow') or 0.0)
-                fcf_yield = fcf / mcap
-                total_shareholder_yield = div_yield + max(0, fcf_yield)
-                hybrid_prf = (float(info.get('returnOnAssets', 0))*0.5) + (float(info.get('operatingMargins', 0))*0.5)
-
-                # 💡 [가성비 모델 업데이트] PEG + Forward PER + EV/EBITDA
-                peg = info.get('pegRatio')
-                val_peg = 1 / float(peg) if peg and float(peg) > 0 else 0
-                
-                fwd_pe = info.get('forwardPE')
-                val_fwd_pe = 1 / float(fwd_pe) if fwd_pe and float(fwd_pe) > 0 else 0
-                
-                ev_ebitda = info.get('enterpriseToEbitda')
-                val_ev_ebitda = 1 / float(ev_ebitda) if ev_ebitda and float(ev_ebitda) > 0 else 0
-                
-                # 비율은 40% / 30% / 30% 로 혼합
-                val_score = (val_peg * 0.4) + (val_fwd_pe * 0.3) + (val_ev_ebitda * 0.3)
-
-            rev_g = max(-0.5, min(0.5, float(info.get('revenueGrowth') or 0.0)))
-            earn_g = max(-0.5, min(0.5, float(info.get('earningsGrowth') or 0.0)))
-            grw_score = (rev_g + earn_g) / 2
-            
-            # 💡 [모멘텀 업데이트] 최근 120일 직관적 추세로 교체
-            if len(hist) >= 120:
-                mom_score = (hist['Close'].iloc[-1] / hist['Close'].iloc[-120]) - 1
-            else:
-                mom_score = (hist['Close'].iloc[-1] / hist['Close'].iloc[0]) - 1
-
-            temp_list.append({
-                '종목': ticker, '기업명': c_name, '섹터': sector, '트랙': track, 'PayoutRatio': payout_ratio,
-                'VAL': val_score, 'MOM': mom_score, 'GRW': grw_score, 'PRF': hybrid_prf, 
-                'YLD': total_shareholder_yield, 'DEBT': debt_to_asset, 'ICR': (ebitda_val / ie_val)
-            })
-        except Exception: pass
-        
-        if i % 10 == 0 or i == total:
-            progress_bar.progress(i / total)
-            status_text.text(f"데이터 수집 중... ({i}/{total})")
-
-    progress_bar.empty()
-    status_text.empty()
-
-    if len(temp_list) == 0:
-        raise ValueError("야후 파이낸스 서버 접속 차단")
-
-    df = pd.DataFrame(temp_list).replace([np.inf, -np.inf], 0).fillna(0)
-    cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
-    for c in cols: df[c] = df[c].clip(df[c].quantile(0.01), df[c].quantile(0.99))
-
-    sector_stats = {sct: {c: {'mean': df[df['섹터']==sct][c].mean(), 'std': df[df['섹터']==sct][c].std()} for c in cols} for sct in df['섹터'].unique()}
-    track_stats = {trk: {c: {'mean': df[df['트랙']==trk][c].mean(), 'std': df[df['트랙']==trk][c].std()} for c in cols} for trk in df['트랙'].unique()}
-
-    z_data = {}
-    for c in cols:
-        sign = -1 if c in ['DEBT'] else 1
-        sct_z = (df[c] - df.groupby('섹터')[c].transform('mean')) / (df.groupby('섹터')[c].transform('std') + 1e-9)
-        trk_z = (df[c] - df.groupby('트랙')[c].transform('mean')) / (df.groupby('트랙')[c].transform('std') + 1e-9)
-        z_data[c] = ((sct_z * 0.5) + (trk_z * 0.5)) * sign
-        z_data[c] = z_data[c].clip(-3.0, 3.0)
-
-    z_hlt = (z_data['DEBT'] + z_data['ICR']) / 2
-    
-    df['Z_HLT'] = z_hlt
-    df['Z_PRF'] = z_data['PRF']
-    df['Z_GRW'] = z_data['GRW']
-    df['Z_VAL'] = z_data['VAL']
-    df['Z_MOM'] = z_data['MOM']
-    df['Z_YLD'] = z_data['YLD']
-    
-    penalty, trap_penalty = [], []
-    for i, row in df.iterrows():
-        p = 0.15 * ((row['DEBT']/50)**2.5) if row['트랙'] == 'STD' and row['DEBT'] >= 50 else 0
-        t_p = 2.0 if row['PayoutRatio'] > 1.0 or row['PayoutRatio'] < 0 else 0
-        penalty.append(p)
-        trap_penalty.append(t_p)
-
-    # 💡 [가중치 세팅] 가성비 20%, 모멘텀 15%, 건전성 20%, 수익성 20%, 성장성 15%, 환원율 10%
-    df['Base'] = (z_data['VAL']*0.20 + z_data['MOM']*0.15 + z_data['GRW']*0.15 + z_data['PRF']*0.20 + z_data['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
-    df['최종점수'] = round(((df['Base'] - (-3.0)) / 6.0) * 100, 1).clip(0, 100)
-    df['투자의견'] = df['최종점수'].apply(get_rating)
-
-    df['건전성'] = df['Z_HLT'].apply(get_grade)
-    df['수익성'] = df['Z_PRF'].apply(get_grade)
-    df['성장성'] = df['Z_GRW'].apply(get_grade)
-    df['가성비'] = df['Z_VAL'].apply(get_grade)
-    df['모멘텀'] = df['Z_MOM'].apply(get_grade)
-    df['환원율'] = df['Z_YLD'].apply(get_grade)
-
-    df = df.sort_values('최종점수', ascending=False).reset_index(drop=True)
-    df.insert(0, '순위', range(1, len(df) + 1))
-    
-    kst = pytz.timezone('Asia/Seoul')
-    update_time = datetime.datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S KST')
-    
-    return df, sector_stats, track_stats, update_time
-
-# --- 3. 글로벌 세션 초기화 및 시크릿 접속 ---
+# 글로벌 세션 초기화
 if 'quant_data' not in st.session_state: 
     st.session_state['quant_data'] = None
-    st.session_state['sector_stats'] = None
-    st.session_state['track_stats'] = None
     st.session_state['last_updated'] = "수집 전"
     
     global_data = load_global_data()
     if global_data is not None:
         st.session_state['quant_data'] = global_data['df']
-        st.session_state['sector_stats'] = global_data['sec_s']
-        st.session_state['track_stats'] = global_data['trk_s']
         st.session_state['last_updated'] = global_data['updated_time']
 
-if 'is_admin' not in st.session_state: 
-    st.session_state['is_admin'] = False
-
-if st.query_params.get("admin") == "chillixlaclffl":
-    st.session_state['is_admin'] = True
+if 'is_admin' not in st.session_state: st.session_state['is_admin'] = False
+if st.query_params.get("admin") == "chillixlaclffl": st.session_state['is_admin'] = True
 
 if st.session_state['quant_data'] is None:
     if st.session_state['is_admin']:
-        st.title("SnowBall 관리자 설정")
-        st.info("현재 로드된 공용 마켓 데이터가 없습니다. 데이터를 세팅해주세요.")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("1. 신규 수집")
-            if st.button("야후 실시간 수집 시작", use_container_width=True):
-                with st.spinner("수집 엔진 가동 중..."):
-                    try:
-                        current_trade_day = get_trade_day()
-                        df, sec_s, trk_s, updated_time = fetch_market_data(current_trade_day)
-                        save_global_data(df, sec_s, trk_s, updated_time)
-                        st.session_state['quant_data'] = df
-                        st.session_state['sector_stats'] = sec_s
-                        st.session_state['track_stats'] = trk_s
-                        st.session_state['last_updated'] = updated_time
-                        st.rerun()
-                    except Exception:
-                        st.error("야후 서버 접근이 차단되었습니다.")
-        
-        with col2:
-            st.subheader("2. 백업 파일 업로드")
-            uploaded_file = st.file_uploader("기존 엑셀/CSV 업로드", type=["xlsx", "csv"])
-            if uploaded_file is not None:
-                try:
-                    df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
-                    cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
-                    sec_s = {sct: {c: {'mean': df[df['섹터']==sct][c].mean(), 'std': df[df['섹터']==sct][c].std()} for c in cols if c in df.columns} for sct in df['섹터'].unique()}
-                    trk_s = {trk: {c: {'mean': df[df['트랙']==trk][c].mean(), 'std': df[df['트랙']==trk][c].std()} for c in cols if c in df.columns} for trk in df['트랙'].unique()} if '트랙' in df.columns else {}
-                    
-                    save_global_data(df, sec_s, trk_s, "수동 파일 동기화 완료")
-                    
-                    st.session_state['quant_data'] = df
-                    st.session_state['sector_stats'] = sec_s
-                    st.session_state['track_stats'] = trk_s
-                    st.session_state['last_updated'] = "수동 파일 동기화 완료"
-                    st.success("로드 성공! 글로벌 환경에 적용되었습니다.")
-                    time.sleep(1)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"업로드 에러: {e}")
-        
-        st.markdown("<br><br><br>", unsafe_allow_html=True)
-        st.caption("powered by TeamChilli")
+        st.title("💰 피터 린치 순현금 초기 설정")
+        st.info("데이터가 없습니다. 엑셀 백업 파일을 업로드해주세요.")
+        uploaded_file = st.file_uploader("기존 엑셀/CSV 업로드", type=["xlsx", "csv"])
+        if uploaded_file is not None:
+            try:
+                df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
+                save_global_data(df, "수동 파일 동기화 완료")
+                st.session_state['quant_data'] = df
+                st.session_state['last_updated'] = "수동 파일 동기화 완료"
+                st.success("로드 성공! 글로벌 환경에 적용되었습니다.")
+                time.sleep(1)
+                st.rerun()
+            except Exception as e: st.error(f"업로드 에러: {e}")
         st.stop()
-        
     else:
         st.info("관리자가 마켓 데이터를 준비하고 있습니다. 잠시 후 다시 접속해 주세요.")
-        st.markdown("<br><br><br>", unsafe_allow_html=True)
-        st.caption("powered by TeamChilli")
         st.stop()
 
-# --- 4. 메인 화면 ---
-st.title("☃ SnowBall")
+# 메인 UI
+st.title("💰 피터 린치 주당 순현금 랭킹")
 st.caption(f"최근 데이터 동기화: {st.session_state['last_updated']}")
 
-tab1, tab2, tab3 = st.tabs(["대시보드", "Snow Ball Quant TOP 100", "개별 종목 분석"])
+tab1, tab2, tab3 = st.tabs(["대시보드", "Net Cash TOP 100", "개별 종목 분석"])
 
 with tab1:
-    st.subheader("SnowBall 평가 모델")
-    st.markdown("""
-    * **건전성** 재무적으로 얼마나 안정적인지 판단
-    * **수익성** 얼마나 효율적으로 이익을 내는지를 판단
-    * **성장성** 매출과 이익, 펀더멘털 확장성
-    * **모멘텀** 시장의 중장기 트렌드 추세 판단
-    * **가성비** 실적이나 자산에 대비한 값어치를 판단
-    * **환원율** 주주에게 얼마나 적극적으로 이익을 돌려주는지를 판단
-    """)
+    st.subheader("💡 피터 린치의 순현금 (Net Cash per Share) 모델")
+    st.markdown('''
+    "어떤 회사의 주당 순현금이 3달러이고 주가가 10달러라면, 당신은 이 주식을 10달러가 아니라 **실질적으로 7달러**에 사는 것이다." 
+    - *피터 린치 (Peter Lynch)*
+    
+    * **순현금 공식:** (현금 및 단기투자자산) - (총 부채)
+    * **주당 순현금:** 순현금 / 총 발행 주식 수
+    * **순현금비율(%):** (주당 순현금 / 현재 주가) × 100
+    
+    비율이 높을수록 기업이 보유한 현금이 주가를 강력하게 지지하고 있다는 뜻이며 하락장에 극강의 방어력을 보여줍니다.
+    ''')
     st.divider()
     
     if st.session_state['is_admin']:
-        st.markdown("### [관리자 전용] 데이터 갱신 패널")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("강제 재수집 (야후 API)", use_container_width=True):
-                try:
-                    current_trade_day = get_trade_day()
-                    df, sec_s, trk_s, updated_time = fetch_market_data(current_trade_day)
-                    save_global_data(df, sec_s, trk_s, updated_time)
-                    st.session_state['quant_data'] = df
-                    st.session_state['sector_stats'] = sec_s
-                    st.session_state['track_stats'] = trk_s
-                    st.session_state['last_updated'] = updated_time
-                    st.success("글로벌 데이터가 갱신되었습니다.")
-                    time.sleep(1)
-                    st.rerun()
-                except Exception:
-                    st.error("야후 통신 실패")
-            
-            if st.session_state['quant_data'] is not None:
-                csv_data = st.session_state['quant_data'].to_csv(index=False).encode('utf-8-sig')
-                st.download_button("현재 데이터 다운로드", data=csv_data, file_name=f"SnowBall_{datetime.datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
-        with col2:
-            uploaded_file = st.file_uploader("백업 엑셀/CSV 수동 업로드", type=["xlsx", "csv"])
-            if uploaded_file is not None:
-                try:
-                    df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
-                    cols = ['VAL', 'MOM', 'GRW', 'PRF', 'YLD', 'DEBT', 'ICR']
-                    sec_s = {sct: {c: {'mean': df[df['섹터']==sct][c].mean(), 'std': df[df['섹터']==sct][c].std()} for c in cols if c in df.columns} for sct in df['섹터'].unique()}
-                    trk_s = {trk: {c: {'mean': df[df['트랙']==trk][c].mean(), 'std': df[df['트랙']==trk][c].std()} for c in cols if c in df.columns} for trk in df['트랙'].unique()} if '트랙' in df.columns else {}
-                    
-                    save_global_data(df, sec_s, trk_s, "수동 파일 동기화 완료")
-                    
-                    st.session_state['quant_data'] = df
-                    st.session_state['sector_stats'] = sec_s
-                    st.session_state['track_stats'] = trk_s
-                    st.session_state['last_updated'] = "수동 파일 동기화 완료"
-                    st.success("데이터 로드 성공! 손님들에게 즉시 노출됩니다.")
-                    time.sleep(1)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"업로드 에러: {e}")
+        st.markdown("### 🛠️ [관리자 전용] 데이터 갱신 패널")
+        uploaded_file = st.file_uploader("백업 엑셀/CSV 수동 업로드 (동기화)", type=["xlsx", "csv"])
+        if uploaded_file is not None:
+            try:
+                df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
+                save_global_data(df, "수동 파일 동기화 완료")
+                st.session_state['quant_data'] = df
+                st.session_state['last_updated'] = "수동 파일 동기화 완료"
+                st.success("데이터 로드 성공! 손님들에게 즉시 노출됩니다.")
+                time.sleep(1)
+                st.rerun()
+            except Exception as e: st.error(f"업로드 에러: {e}")
 
 with tab2:
-    st.subheader("🏆 Snow Ball Quant TOP 100")
+    st.subheader("🏆 순현금비율(%) TOP 100 (S&P 1500)")
     if st.session_state['quant_data'] is not None:
-        display_cols = ['순위', '종목', '기업명', '최종점수', '투자의견', '섹터', '건전성', '수익성', '성장성', '가성비', '모멘텀', '환원율']
+        df = st.session_state['quant_data'].copy()
+        df = df[df['순현금비율(%)'] > 0] # 순현금이 플러스인 기업만 필터링
+        
         st.dataframe(
-            st.session_state['quant_data'][display_cols].head(100),
+            df.head(100),
             use_container_width=True,
             hide_index=True,
             column_config={
                 "순위": st.column_config.NumberColumn(width="small"),
                 "종목": st.column_config.TextColumn(width="small"),
                 "기업명": st.column_config.TextColumn(width="medium"),
-                "최종점수": st.column_config.NumberColumn(width="small", format="%.1f"),
-                "투자의견": st.column_config.TextColumn(width="small"),
-                "섹터": st.column_config.TextColumn(width="medium"),
-                "건전성": st.column_config.TextColumn(width="small"),
-                "수익성": st.column_config.TextColumn(width="small"),
-                "성장성": st.column_config.TextColumn(width="small"),
-                "가성비": st.column_config.TextColumn(width="small"),
-                "모멘텀": st.column_config.TextColumn(width="small"),
-                "환원율": st.column_config.TextColumn(width="small")
+                "현재주가($)": st.column_config.NumberColumn(format="$%.2f"),
+                "주당순현금($)": st.column_config.NumberColumn(format="$%.2f"),
+                "순현금비율(%)": st.column_config.ProgressColumn(
+                    format="%d%%",
+                    min_value=0,
+                    max_value=100
+                ),
+                "총현금(B$)": st.column_config.NumberColumn(format="%.2f B"),
+                "총부채(B$)": st.column_config.NumberColumn(format="%.2f B")
             }
         )
 
 with tab3:
-    st.subheader("개별 종목 분석")
+    st.subheader("🔍 개별 종목 분석")
     with st.form("search_form"):
-        ticker_input = st.text_input("분석할 티커 (예: AAPL)")
+        ticker_input = st.text_input("분석할 티커 (예: AAPL, META)")
         submit_btn = st.form_submit_button("분석 시작")
         
     if submit_btn and ticker_input:
@@ -370,148 +140,28 @@ with tab3:
             with st.spinner("조회 중..."):
                 row = df[df['종목'] == tk].iloc[0]
                 
-                final_score = row['최종점수']
-                rating = get_rating(final_score)
-                c_name = row['기업명']
-                sector = row['섹터']
-                track = row.get('트랙', 'Unknown')
+                price = row['현재주가($)']
+                net_cash_per_share = row['주당순현금($)']
+                ratio = row['순현금비율(%)']
                 
-                eval_scores = {
-                    '가성비': row['Z_VAL'], '모멘텀': row['Z_MOM'], '성장성': row['Z_GRW'], 
-                    '수익성': row['Z_PRF'], '환원율': row['Z_YLD'], '건전성': row['Z_HLT']
-                }
-                best_p = max(eval_scores, key=eval_scores.get)
-                worst_p = min(eval_scores, key=eval_scores.get)
-                
-                trap_penalty = row.get('TrapPenalty', 0)
-                
-                if trap_penalty > 0: summ = "배당 함정(Yield Trap) 종목입니다. 절대 주의하세요."
-                elif final_score >= 80: summ = "흠잡을 데 없는 완벽한 수치입니다."
-                elif final_score >= 60: summ = f"[{best_p}] 지표가 훌륭합니다. [{worst_p}] 지표만 유의하시면 안정적인 종목입니다."
-                elif final_score >= 40: summ = f"무난한 수준입니다. [{best_p}] 지표는 긍정적이나 [{worst_p}] 지표 확인이 필요합니다."
-                elif final_score >= 20: summ = f"[{worst_p}] 지표가 심각하여 매수에 주의가 필요합니다."
-                else: summ = f"[{worst_p}] 지표 등 전반적인 상태가 매우 부진합니다."
+                if ratio > 50: summ = "엄청난 수준의 현금을 보유하고 있습니다. 회사 금고의 현금이 주가의 절반 이상을 보증합니다!"
+                elif ratio > 20: summ = "매우 건전한 상태입니다. 든든한 순현금이 하락장을 방어해 줄 것입니다."
+                elif ratio > 0: summ = "부채보다 현금이 더 많아 재무적으로 안정적입니다."
+                else: summ = "현재 현금보다 갚아야 할 부채가 더 많아 주당 순현금이 마이너스(-) 상태입니다."
 
-                st.success(f"### {c_name} ({tk}) : {final_score} 점 ({rating})")
-                st.caption(f"섹터: {sector} | 랭킹: 전체 {row['순위']}위")
-                st.info(f"총평: {summ}")
+                st.success(f"### {row['기업명']} ({tk}) : 순현금비율 {ratio}%")
+                st.info(f"💡 총평: {summ}")
                 
                 col1, col2, col3 = st.columns(3)
-                col1.metric("건전성", row['건전성'])
-                col2.metric("수익성", row['수익성'])
-                col3.metric("성장성", row['성장성'])
-                col4, col5, col6 = st.columns(3)
-                col4.metric("가성비", row['가성비'])
-                col5.metric("모멘텀", row['모멘텀'])
-                col6.metric("환원율", row['환원율'])
+                col1.metric("현재 주가", f"${price}")
+                col2.metric("주당 순현금", f"${net_cash_per_share}", f"{ratio}% of Price")
+                col3.metric("실질 매수단가", f"${max(0, price - net_cash_per_share):.2f}", delta_color="inverse")
                 
+                col4, col5 = st.columns(2)
+                col4.metric("총 현금 (Total Cash)", f"${row['총현금(B$)']} Billion")
+                col5.metric("총 부채 (Total Debt)", f"${row['총부채(B$)']} Billion")
         else:
-            st.warning(f"'{tk}'는 S&P 900 목록에 없어 실시간 수집을 시도합니다.")
-            with st.spinner("수집 중..."):
-                try:
-                    s = yf.Ticker(tk)
-                    info = s.info
-                    hist = s.history(period="1y")
-                    
-                    if hist.empty or len(hist) < 22:
-                        st.error("데이터 부족 또는 상장폐지 종목입니다.")
-                    elif 'sector' not in info and 'currentPrice' not in info:
-                        st.error("ETF 또는 재무 데이터 미제공 종목입니다.")
-                    else:
-                        sector = info.get('sector', 'Unknown')
-                        track = 'FIN' if sector in ['Financial Services', 'Real Estate'] else 'STD'
-                        c_name = info.get('shortName', tk)
-                        
-                        debt_eq = info.get('debtToEquity')
-                        debt_to_asset = (float(debt_eq) / 100.0) / (1 + float(debt_eq) / 100.0) * 100.0 if debt_eq and float(debt_eq) >= 0 else 100.0
-                        ie_val = info.get('interestExpense', 1.0) if info.get('interestExpense') not in [None, 0] else 1.0
-                        icr_val = info.get('ebitda', 1.0) / ie_val
-                        div_yield = float(info.get('dividendYield') or 0.0)
-                        
-                        if track == 'FIN':
-                            hybrid_prf = float(info.get('returnOnEquity') or 0.0)
-                            total_shareholder_yield = div_yield
-                            pe = info.get('trailingPE')
-                            pb = info.get('priceToBook')
-                            val_score = ((1/float(pe) if pe and float(pe)>0 else 0)*0.5) + ((1/float(pb) if pb and float(pb)>0 else 0)*0.5)
-                        else:
-                            mcap = info.get('marketCap', 1) or 1
-                            fcf_yield = float(info.get('freeCashflow') or 0.0) / mcap
-                            total_shareholder_yield = div_yield + max(0, fcf_yield)
-                            hybrid_prf = (float(info.get('returnOnAssets') or 0.0)*0.5) + (float(info.get('operatingMargins') or 0.0)*0.5)
-                            
-                            # 💡 [가성비 모델 업데이트] PEG + Forward PER + EV/EBITDA
-                            peg = info.get('pegRatio')
-                            val_peg = 1 / float(peg) if peg and float(peg) > 0 else 0
-                            
-                            fwd_pe = info.get('forwardPE')
-                            val_fwd_pe = 1 / float(fwd_pe) if fwd_pe and float(fwd_pe) > 0 else 0
-                            
-                            ev_ebitda = info.get('enterpriseToEbitda')
-                            val_ev_ebitda = 1 / float(ev_ebitda) if ev_ebitda and float(ev_ebitda) > 0 else 0
-                            
-                            val_score = (val_peg * 0.4) + (val_fwd_pe * 0.3) + (val_ev_ebitda * 0.3)
+            st.error(f"'{tk}'는 DB에 없거나 순현금 분석 대상이 아닙니다. (현재 S&P 1500만 조회 가능)")
 
-                        rev_g = max(-0.5, min(0.5, float(info.get('revenueGrowth') or 0.0)))
-                        earn_g = max(-0.5, min(0.5, float(info.get('earningsGrowth') or 0.0)))
-                        grw_score = (rev_g + earn_g) / 2
-                        
-                        # 💡 [실시간 검색 엔진도 120일 모멘텀으로 업그레이드]
-                        if len(hist) >= 120:
-                            mom_score = (hist['Close'].iloc[-1] / hist['Close'].iloc[-120]) - 1
-                        else:
-                            mom_score = (hist['Close'].iloc[-1] / hist['Close'].iloc[0]) - 1
-
-                        raw = {'VAL': val_score, 'MOM': mom_score, 'GRW': grw_score, 'PRF': hybrid_prf, 'YLD': total_shareholder_yield, 'DEBT': debt_to_asset, 'ICR': icr_val}
-                        
-                        sct_stats = st.session_state.get('sector_stats')
-                        trk_stats = st.session_state.get('track_stats')
-                        
-                        s_stat = sct_stats.get(sector, sct_stats[list(sct_stats.keys())[0]])
-                        t_stat = trk_stats.get(track, trk_stats[list(trk_stats.keys())[0]])
-
-                        z_scores = {}
-                        for key in raw.keys():
-                            s_z = (raw[key] - s_stat[key]['mean']) / (s_stat[key]['std'] + 1e-9)
-                            t_z = (raw[key] - t_stat[key]['mean']) / (t_stat[key]['std'] + 1e-9)
-                            z = (s_z * 0.5 + t_z * 0.5) * (-1 if key == 'DEBT' else 1)
-                            z_scores[key] = max(-3.0, min(3.0, z))
-
-                        z_hlt = (z_scores['DEBT'] + z_scores['ICR']) / 2
-                        penalty = 0.15 * ((debt_to_asset/50)**2.5) if track == 'STD' and debt_to_asset >= 50 else 0
-                        payout_ratio = float(info.get('payoutRatio') or 0.0)
-                        trap_penalty = 2.0 if payout_ratio > 1.0 or payout_ratio < 0 else 0
-
-                        # 💡 [핵심] 가성비 20%, 모멘텀 15%, 건전성 20%, 수익성 20%, 성장성 15%, 환원율 10%
-                        base = (z_scores['VAL']*0.20 + z_scores['MOM']*0.15 + z_scores['GRW']*0.15 + z_scores['PRF']*0.20 + z_scores['YLD']*0.10 + z_hlt*0.20) - penalty - trap_penalty
-                        final_score = round(max(0, min(100, ((base - (-3.0)) / 6.0) * 100)), 1)
-                        
-                        eval_scores = {'가성비': z_scores['VAL'], '모멘텀': z_scores['MOM'], '성장성': z_scores['GRW'], '수익성': z_scores['PRF'], '환원율': z_scores['YLD'], '건전성': z_hlt}
-                        best_p = max(eval_scores, key=eval_scores.get)
-                        worst_p = min(eval_scores, key=eval_scores.get)
-                        
-                        if trap_penalty > 0: summ = "배당 함정(Yield Trap) 종목입니다. 절대 주의하세요."
-                        elif final_score >= 80: summ = "흠잡을 데 없는 완벽한 수치입니다."
-                        elif final_score >= 60: summ = f"[{best_p}] 지표가 훌륭합니다. [{worst_p}] 지표만 유의하시면 안정적인 종목입니다."
-                        elif final_score >= 40: summ = f"무난한 수준입니다. [{best_p}] 지표는 긍정적이나 [{worst_p}] 지표 확인이 필요합니다."
-                        elif final_score >= 20: summ = f"[{worst_p}] 지표가 심각하여 매수에 주의가 필요합니다."
-                        else: summ = f"[{worst_p}] 지표 등 전반적인 상태가 매우 부진합니다."
-
-                        st.success(f"### {c_name} ({tk}) : {final_score} 점 ({get_rating(final_score)})")
-                        st.caption(f"섹터: {sector} | 유니버스: {'금융/리츠 트랙' if track=='FIN' else '스탠다드 트랙'} (실시간 수집)")
-                        st.info(f"총평: {summ}")
-                        
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("건전성", get_grade(z_hlt))
-                        col2.metric("수익성", get_grade(z_scores['PRF']))
-                        col3.metric("성장성", get_grade(z_scores['GRW']))
-                        col4, col5, col6 = st.columns(3)
-                        col4.metric("가성비", get_grade(z_scores['VAL']))
-                        col5.metric("모멘텀", get_grade(z_scores['MOM']))
-                        col6.metric("환원율", get_grade(z_scores['YLD']))
-
-                except Exception:
-                    st.error("야후 서버 통신에 실패했습니다.")
-
-st.markdown("<br><br><br>", unsafe_allow_html=True)
-st.caption("powered by TeamChilli")
+st.markdown("<br><br><br><div style='text-align: center; color: #888; font-size: 12px;'>powered by TeamChilli</div>", unsafe_allow_html=True)
+```
