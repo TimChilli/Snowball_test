@@ -2,11 +2,11 @@
 ===============================================================================
 Project: SnowBall Quant Terminal (Web Edition)
 Author: TeamChilli
-Version: 10.3 (Lynch Net Cash - Precision & UI Final)
+Version: 10.4 (Market Cap & Sector Average PER - EPS > 0 Filtered)
 Description: 
-    - 리스 부채 등 회계 노이즈를 완벽히 제거한 순수 현금/부채 추출
-    - 천 단위 콤마(,) 렌더링 및 PER 3종 세트 테이블 편입
-    - 순위 칼럼 최소화 및 컨테이너 핏 최적화
+    - S&P 1500 비금융 대상 피터 린치 주당 순현금 모델
+    - 시가총액(M$) 추가
+    - EPS > 0 (흑자) 기업만 선별하여 산출한 섹터 평균 PER 탑재
 ===============================================================================
 """
 
@@ -55,8 +55,12 @@ st.markdown("""
 # =============================================================================
 # 3. 유틸리티 및 데이터 캐싱 함수
 # =============================================================================
-def save_global_data(df, updated_time):
-    data = {'df': df, 'updated_time': updated_time}
+def save_global_data(df, sector_per_map, updated_time):
+    data = {
+        'df': df,
+        'sector_per_map': sector_per_map,
+        'updated_time': updated_time
+    }
     try:
         with open(SHARED_FILE, 'wb') as f:
             pickle.dump(data, f)
@@ -82,7 +86,6 @@ def get_trade_day():
     return now.strftime('%Y-%m-%d')
 
 def get_bs_value(bs, possible_keys):
-    """지정된 정확한 키값만 순차적으로 찾아 반환 (노이즈 배제)"""
     if bs.empty: return 0
     recent_bs = bs.iloc[:, 0]
     for key in possible_keys:
@@ -129,21 +132,18 @@ def calculate_single_stock_lynch_model(tk):
     
     price = info.get('currentPrice') or info.get('previousClose')
     shares = info.get('impliedSharesOutstanding') or info.get('sharesOutstanding')
+    market_cap = info.get('marketCap', 0)
     
     if not price or not shares or shares == 0 or bs.empty:
         return None
         
     c_name = info.get('shortName', info.get('longName', tk))
     
-    # -------------------------------------------------------------------------
-    # 💡 [노이즈 완전 제거] 현금 및 부채 핀셋 추출 (리스 부채 제외)
-    # -------------------------------------------------------------------------
-    # 가장 순수한 '현금 및 현금성 자산'과 '단기 투자'만 포함
+    # 1. 현금 및 장기부채 산출
     cash = get_bs_value(bs, ['Cash And Cash Equivalents'])
     short_inv = get_bs_value(bs, ['Other Short Term Investments'])
     total_cash = cash + short_inv
     
-    # 리스 부채(Lease Obligation)가 포함된 항목을 철저히 배제하고 '순수 은행 부채'만 포함
     long_debt = get_bs_value(bs, ['Long Term Debt'])
     current_long_debt = get_bs_value(bs, ['Current Debt', 'Current Portion Of Long Term Debt'])
     adjusted_long_debt = long_debt + current_long_debt
@@ -152,7 +152,7 @@ def calculate_single_stock_lynch_model(tk):
     net_cash_per_share = net_cash / shares
     net_cash_ratio = (net_cash_per_share / price) * 100
     
-    # 순이익 연속 성장(▲) 로직
+    # 2. 순이익 연속 성장(▲) 로직
     consecutive_growth = 0
     if not inc.empty:
         for key in ['Net Income', 'Net Income Common Stockholders']:
@@ -168,7 +168,7 @@ def calculate_single_stock_lynch_model(tk):
                 break
     growth_str = '▲' * consecutive_growth if consecutive_growth > 0 else '-'
 
-    # PER 3종 세트 산출
+    # 3. PER 3종 세트
     trailing_pe = info.get('trailingPE', 0)
     forward_pe = info.get('forwardPE', 0)
     eps = info.get('trailingEps', 0)
@@ -185,11 +185,12 @@ def calculate_single_stock_lynch_model(tk):
         '현재주가($)': price,
         '주당순현금($)': round(net_cash_per_share, 2),
         '순현금비율(%)': round(net_cash_ratio, 2),
+        '시가총액(M$)': round(market_cap / 1e6, 2) if market_cap else 0.0,
         '총현금(M$)': round(total_cash / 1e6, 2),
         '실질장기부채(M$)': round(adjusted_long_debt / 1e6, 2),
         '순이익성장': growth_str,
-        'PER': round(trailing_pe, 2) if trailing_pe else 0.0,
-        'Fwd_PER': round(forward_pe, 2) if forward_pe else 0.0,
+        'PER': round(trailing_pe, 2) if trailing_pe and trailing_pe > 0 else 0.0,
+        'Fwd_PER': round(forward_pe, 2) if forward_pe and forward_pe > 0 else 0.0,
         '순현금_PER': round(net_cash_per, 2)
     }
 
@@ -224,24 +225,34 @@ def process_market_data():
         raise ValueError("야후 파이낸스 서버가 접근을 차단하여 데이터를 가져오지 못했습니다.")
 
     df = pd.DataFrame(temp_list).replace([np.inf, -np.inf], 0).fillna(0)
+    
+    # 💡 [핵심] EPS > 0 (PER > 0인 흑자 기업)만 선별하여 섹터 평균 PER 산출
+    valid_per_df = df[df['PER'] > 0]
+    sector_per_map = valid_per_df.groupby('섹터')['PER'].mean().round(1).to_dict()
+    
+    # 데이터프레임에 섹터 평균 PER 매핑
+    df['섹터평균_PER'] = df['섹터'].map(sector_per_map).fillna(0.0)
+    
     df = df.sort_values('순현금비율(%)', ascending=False).reset_index(drop=True)
     df.insert(0, '순위', range(1, len(df) + 1))
     
     kst = pytz.timezone('Asia/Seoul')
     update_time = datetime.datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S KST')
     
-    return df, update_time
+    return df, sector_per_map, update_time
 
 # =============================================================================
 # 5. 세션 상태 및 라우팅 컨트롤러
 # =============================================================================
 if 'quant_data' not in st.session_state: 
     st.session_state['quant_data'] = None
+    st.session_state['sector_per_map'] = {}
     st.session_state['last_updated'] = "수집 전"
     
     global_data = load_global_data()
     if global_data is not None:
         st.session_state['quant_data'] = global_data['df']
+        st.session_state['sector_per_map'] = global_data.get('sector_per_map', {})
         st.session_state['last_updated'] = global_data['updated_time']
 
 if 'is_admin' not in st.session_state: 
@@ -259,9 +270,10 @@ if st.session_state['quant_data'] is None:
         if st.button("🚀 전체 S&P 1500 실시간 스크래핑 시작", use_container_width=True):
             with st.spinner("야후 파이낸스 재무상태표 원본을 분석 중입니다... (약 10~15분 소요)"):
                 try:
-                    df, updated_time = process_market_data()
-                    save_global_data(df, updated_time)
+                    df, sector_map, updated_time = process_market_data()
+                    save_global_data(df, sector_map, updated_time)
                     st.session_state['quant_data'] = df
+                    st.session_state['sector_per_map'] = sector_map
                     st.session_state['last_updated'] = updated_time
                     st.rerun()
                 except Exception as e:
@@ -292,10 +304,11 @@ with tab1:
     
     * **순현금 공식:** (순수 현금 및 단기투자자산) - (순수 장기 부채 및 1년 내 만기도래분)
     * **순현금 PER:** (현재 주가 - 주당 순현금) / 1주당 순이익(EPS)
+    * **섹터 평균 PER:** 해당 업종 내 **흑자 기업(EPS > 0)**의 PER 평균값
     
     영업을 위한 단기적인 외상값이나 가짜 부채(매장 리스 등)는 무시하고, 금고에 당장 현금화할 수 있는 자산에서 은행 빚을 
     모두 털어낸 깐깐한 오리지널 공식을 사용합니다. 겉으로 보이는 PER에 속지 마시고, 
-    기업의 알짜 현금을 차감한 **'순현금 PER'**을 통해 숨겨진 저평가 기업을 발굴하세요.
+    기업의 알짜 현금을 차감한 **'순현금 PER'**을 해당 업종의 평균 PER과 비교하여 알짜 저평가 기업을 발굴하세요.
     ''')
     st.divider()
     
@@ -306,9 +319,10 @@ with tab1:
             if st.button("야후 API 전체 강제 재수집", use_container_width=True):
                 with st.spinner("야후 서버에서 전체 데이터를 다시 긁어오는 중..."):
                     try:
-                        df, updated_time = process_market_data()
-                        save_global_data(df, updated_time)
+                        df, sector_map, updated_time = process_market_data()
+                        save_global_data(df, sector_map, updated_time)
                         st.session_state['quant_data'] = df
+                        st.session_state['sector_per_map'] = sector_map
                         st.session_state['last_updated'] = updated_time
                         st.success("글로벌 데이터가 갱신되었습니다.")
                         time.sleep(1)
@@ -332,9 +346,12 @@ with tab2:
         df = st.session_state['quant_data'].copy()
         df = df[df['순현금비율(%)'] > 0] 
         
-        display_cols = ['순위', '종목', '기업명', '순현금비율(%)', 'PER', 'Fwd_PER', '순현금_PER', '순이익성장', '현재주가($)', '주당순현금($)', '총현금(M$)', '실질장기부채(M$)']
+        display_cols = [
+            '순위', '종목', '기업명', '섹터', '시가총액(M$)', '순현금비율(%)', 
+            'PER', 'Fwd_PER', '순현금_PER', '섹터평균_PER', '순이익성장', 
+            '현재주가($)', '주당순현금($)', '총현금(M$)', '실질장기부채(M$)'
+        ]
         
-        # 💡 [UI 업데이트] 천 단위 콤마 렌더링 및 칼럼 폭 최적화
         st.dataframe(
             df[display_cols].head(100),
             use_container_width=True,
@@ -343,10 +360,13 @@ with tab2:
                 "순위": st.column_config.NumberColumn(width=50, format="%d"),
                 "종목": st.column_config.TextColumn(width=80),
                 "기업명": st.column_config.TextColumn(width="medium"),
+                "섹터": st.column_config.TextColumn(width="medium"),
+                "시가총액(M$)": st.column_config.NumberColumn(format="%,.0f M"),
                 "순현금비율(%)": st.column_config.ProgressColumn(format="%d%%", min_value=0, max_value=100),
                 "PER": st.column_config.NumberColumn(format="%,.1f"),
                 "Fwd_PER": st.column_config.NumberColumn(format="%,.1f"),
                 "순현금_PER": st.column_config.NumberColumn(format="%,.1f", help="(현재 주가 - 주당 순현금) / EPS"),
+                "섹터평균_PER": st.column_config.NumberColumn(format="%,.1f", help="해당 섹터 내 흑자(EPS>0) 기업의 평균 PER"),
                 "순이익성장": st.column_config.TextColumn(width=80, help="연간 순이익 연속 상승 횟수 (▲)"),
                 "현재주가($)": st.column_config.NumberColumn(format="$%,.2f"),
                 "주당순현금($)": st.column_config.NumberColumn(format="$%,.2f"),
@@ -382,21 +402,25 @@ with tab3:
                 st.caption(f"섹터: {row['섹터']} | 랭킹: 비금융 전체 {row['순위']}위")
                 st.info(f"💡 총평: {summ}")
                 
-                # 💡 [UI 업데이트] 개별 종목 분석 패널 천 단위 콤마 반영
-                col1, col2, col3 = st.columns(3)
+                # 1행: 주가 및 순현금
+                col1, col2, col3, col4 = st.columns(4)
                 col1.metric("현재 주가", f"${price:,.2f}")
                 col2.metric("주당 순현금", f"${net_cash_per_share:,.2f}", f"{ratio:,.1f}% of Price")
                 col3.metric("실질 매수단가", f"${max(0, price - net_cash_per_share):,.2f}", delta_color="inverse")
+                col4.metric("시가총액 (Market Cap)", f"${row['시가총액(M$)']:,.0f} M")
                 
-                col4, col5, col6 = st.columns(3)
-                col4.metric("PER (기본)", f"{row['PER']:,.1f}" if row['PER'] > 0 else "N/A")
-                col5.metric("Forward PER", f"{row['Fwd_PER']:,.1f}" if row['Fwd_PER'] > 0 else "N/A")
-                col6.metric("순현금 PER", f"{row['순현금_PER']:,.1f}" if row['순현금_PER'] > 0 else "N/A", help="실질 매수단가 / EPS")
+                # 2행: PER 밸류에이션 비교
+                col5, col6, col7, col8 = st.columns(4)
+                col5.metric("PER (기본)", f"{row['PER']:,.1f}" if row['PER'] > 0 else "N/A")
+                col6.metric("Forward PER", f"{row['Fwd_PER']:,.1f}" if row['Fwd_PER'] > 0 else "N/A")
+                col7.metric("순현금 PER", f"{row['순현금_PER']:,.1f}" if row['순현금_PER'] > 0 else "N/A", help="실질 매수단가 / EPS")
+                col8.metric("섹터 평균 PER", f"{row['섹터평균_PER']:,.1f}" if row['섹터평균_PER'] > 0 else "N/A", help="동종 업계 흑자 기업 평균 PER")
                 
-                col7, col8, col9 = st.columns(3)
-                col7.metric("총 현금 (Total Cash)", f"${row['총현금(M$)']:,.1f} M")
-                col8.metric("조정 장기부채 (Long Term)", f"${row['실질장기부채(M$)']:,.1f} M")
-                col9.metric("연간 순이익 성장", row['순이익성장'] if row['순이익성장'] != '-' else "성장 안함")
+                # 3행: 세부 재무 상태
+                col9, col10, col11 = st.columns(3)
+                col9.metric("총 현금 (Total Cash)", f"${row['총현금(M$)']:,.1f} M")
+                col10.metric("조정 장기부채 (Long Term)", f"${row['실질장기부채(M$)']:,.1f} M")
+                col11.metric("연간 순이익 성장", row['순이익성장'] if row['순이익성장'] != '-' else "성장 안함")
                 
         else:
             st.warning(f"'{tk}'는 현재 DB에 없어 야후 파이낸스에서 실시간으로 재무제표를 조회합니다.")
@@ -410,6 +434,10 @@ with tab3:
                         net_cash_per_share = raw['주당순현금($)']
                         ratio = raw['순현금비율(%)']
                         
+                        # 스토리지의 섹터 평균 PER 조회
+                        sec_per_map = st.session_state.get('sector_per_map', {})
+                        sec_avg_per = sec_per_map.get(raw['섹터'], 0.0)
+                        
                         if ratio > 50: summ = "엄청난 수준의 현금을 보유하고 있습니다. 회사 금고의 현금이 주가의 절반 이상을 보증합니다!"
                         elif ratio > 20: summ = "매우 건전한 상태입니다. 든든한 순현금이 하락장을 방어해 줄 것입니다."
                         elif ratio > 0: summ = "실질 장기부채보다 현금이 더 많아 재무적으로 안정적입니다."
@@ -419,20 +447,22 @@ with tab3:
                         st.caption(f"섹터: {raw['섹터']} | (실시간 산출 데이터)")
                         st.info(f"💡 총평: {summ}")
                         
-                        col1, col2, col3 = st.columns(3)
+                        col1, col2, col3, col4 = st.columns(4)
                         col1.metric("현재 주가", f"${price:,.2f}")
                         col2.metric("주당 순현금", f"${net_cash_per_share:,.2f}", f"{ratio:,.1f}% of Price")
                         col3.metric("실질 매수단가", f"${max(0, price - net_cash_per_share):,.2f}", delta_color="inverse")
+                        col4.metric("시가총액 (Market Cap)", f"${raw['시가총액(M$)']:,.0f} M")
                         
-                        col4, col5, col6 = st.columns(3)
-                        col4.metric("PER (기본)", f"{raw['PER']:,.1f}" if raw['PER'] > 0 else "N/A")
-                        col5.metric("Forward PER", f"{raw['Fwd_PER']:,.1f}" if raw['Fwd_PER'] > 0 else "N/A")
-                        col6.metric("순현금 PER", f"{raw['순현금_PER']:,.1f}" if raw['순현금_PER'] > 0 else "N/A")
+                        col5, col6, col7, col8 = st.columns(4)
+                        col5.metric("PER (기본)", f"{raw['PER']:,.1f}" if raw['PER'] > 0 else "N/A")
+                        col6.metric("Forward PER", f"{raw['Fwd_PER']:,.1f}" if raw['Fwd_PER'] > 0 else "N/A")
+                        col7.metric("순현금 PER", f"{raw['순현금_PER']:,.1f}" if raw['순현금_PER'] > 0 else "N/A")
+                        col8.metric("섹터 평균 PER", f"{sec_avg_per:,.1f}" if sec_avg_per > 0 else "N/A")
                         
-                        col7, col8, col9 = st.columns(3)
-                        col7.metric("총 현금 (Total Cash)", f"${raw['총현금(M$)']:,.1f} M")
-                        col8.metric("조정 장기부채 (Long Term)", f"${raw['실질장기부채(M$)']:,.1f} M")
-                        col9.metric("연간 순이익 성장", raw['순이익성장'] if raw['순이익성장'] != '-' else "성장 안함")
+                        col9, col10, col11 = st.columns(3)
+                        col9.metric("총 현금 (Total Cash)", f"${raw['총현금(M$)']:,.1f} M")
+                        col10.metric("조정 장기부채 (Long Term)", f"${raw['실질장기부채(M$)']:,.1f} M")
+                        col11.metric("연간 순이익 성장", raw['순이익성장'] if raw['순이익성장'] != '-' else "성장 안함")
                         
                 except Exception as e:
                     logger.error(f"Live fetch error for {tk}: {e}")
