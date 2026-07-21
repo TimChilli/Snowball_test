@@ -2,12 +2,12 @@
 ===============================================================================
 Project: SnowBall Quant Terminal (Web Edition)
 Author: TeamChilli
-Version: 11.0 (US Full Market 6000+ Web Scanner Integrated)
+Version: 11.1 (Smart Resume & Persistent Messaging)
 Description: 
-    - S&P 1500 실시간 스캔 외에 미국 전체 주식(약 6,000개) 스캔 기능 웹 통합
-    - 나스닥 공식 서버 FTP 통신 및 SEC 백업 통신 연동
-    - 중간 튕김 방지 및 차단 시 부분 데이터 강제 보존(비상 세이브) 기능 탑재
-    - 피터 린치 오리지널 순현금 모델 적용 및 UI 최적화 유지
+    - 실시간 예상/현재 소요시간 UI 표기
+    - 야후 API 차단(Too Many Requests) 감지 시 비상 세이브(Graceful Stop) 기능
+    - 남은 종목만 골라내는 '이어서 수집(Resume)' 아키텍처 탑재
+    - 휘발성 알림 대신 session_state 기반 영구 메세지 시스템 적용
 ===============================================================================
 """
 
@@ -79,13 +79,6 @@ def load_global_data():
             return None
     return None
 
-def get_trade_day():
-    tz = pytz.timezone('US/Eastern')
-    now = datetime.datetime.now(tz)
-    if now.hour < 4:
-        return (now - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
-    return now.strftime('%Y-%m-%d')
-
 def get_bs_value(bs, possible_keys):
     if bs is None or bs.empty: 
         return 0.0
@@ -98,49 +91,38 @@ def get_bs_value(bs, possible_keys):
     return 0.0
 
 # =============================================================================
-# 4. 티커 수집 모듈 (S&P 1500 vs US Full Market)
+# 4. 티커 수집 모듈
 # =============================================================================
 def fetch_sp1500_tickers():
-    """위키피디아 S&P 1500 수집 (대형/중형/소형)"""
-    logger.info("Fetching S&P 1500 tickers...")
     session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-    
+    session.headers.update({'User-Agent': 'Mozilla/5.0'})
     def get_t(url):
         try:
             res = requests.get(url, headers=session.headers)
             df = pd.read_html(io.StringIO(res.text))[0]
             return df['Symbol' if 'Symbol' in df.columns else 'Ticker symbol'].tolist()
-        except Exception:
-            return []
+        except Exception: return []
     
     sp500 = get_t('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
     sp400 = get_t('https://en.wikipedia.org/wiki/List_of_S%26P_400_companies')
     sp600 = get_t('https://en.wikipedia.org/wiki/List_of_S%26P_600_companies')
-    
-    tickers = list(set(sp500 + sp400 + sp600))
-    return [t.replace('.', '-') for t in tickers]
+    return [t.replace('.', '-') for t in list(set(sp500 + sp400 + sp600))]
 
 def get_us_full_tickers():
-    """미국 증시 전 종목 티커 수집 (나스닥 FTP 및 SEC 백업)"""
-    logger.info("Fetching US Full Market tickers...")
     url = "ftp://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqtraded.txt"
     try:
         df = pd.read_csv(url, sep="|")
         df = df[(df['Test Issue'] == 'N') & (df['ETF'] == 'N')]
         tickers = df['NASDAQ Symbol'].dropna().tolist()
-        tickers = [str(t).strip().replace('.', '-') for t in tickers if isinstance(t, str)]
-        return tickers
-    except Exception as e:
-        logger.warning(f"FTP failed ({e}), trying SEC fallback...")
+        return [str(t).strip().replace('.', '-') for t in tickers if isinstance(t, str)]
+    except Exception:
         try:
             headers = {'User-Agent': 'Mozilla/5.0'}
             res = requests.get('https://www.sec.gov/files/company_tickers.json', headers=headers)
             data = res.json()
             tickers = [item['ticker'].replace('.', '-') for item in data.values()]
             return list(set(tickers))
-        except Exception as e2:
-            logger.error(f"Both ticker sources failed: {e2}")
+        except Exception:
             return []
 
 # =============================================================================
@@ -151,48 +133,25 @@ def calculate_single_stock_lynch_model(tk):
     info = s.info
     
     sector = info.get('sector', 'Unknown')
-    if sector in ['Financial Services', 'Real Estate']:
-        return None
+    if sector in ['Financial Services', 'Real Estate']: return None
         
     bs = s.quarterly_balance_sheet
-    if bs is None or bs.empty:
-        bs = s.balance_sheet
+    if bs is None or bs.empty: bs = s.balance_sheet
         
     inc = s.financials
-    
     price = info.get('currentPrice') or info.get('previousClose')
     shares = info.get('impliedSharesOutstanding') or info.get('sharesOutstanding')
     market_cap = info.get('marketCap', 0)
     
-    if not price or not shares or shares == 0 or bs is None or bs.empty:
-        return None
+    if not price or not shares or shares == 0 or bs is None or bs.empty: return None
         
-    c_name = info.get('shortName', info.get('longName', tk))
-    
-    cash_keys = [
-        'Cash Cash Equivalents And Short Term Investments',
-        'Cash And Cash Equivalents',
-        'Cash Financial',
-        'Cash',
-        'Other Short Term Investments'
-    ]
-    
-    long_debt_keys = [
-        'Long Term Debt Non Current',
-        'Long Term Debt',
-        'Total Debt Non Current',
-        'Total Long Term Debt',
-        'Current Debt And Capital Lease Obligation',
-        'Current Debt',
-        'Current Portion Of Long Term Debt'
-    ]
+    cash_keys = ['Cash Cash Equivalents And Short Term Investments', 'Cash And Cash Equivalents', 'Cash Financial', 'Cash', 'Other Short Term Investments']
+    long_debt_keys = ['Long Term Debt Non Current', 'Long Term Debt', 'Total Debt Non Current', 'Total Long Term Debt', 'Current Debt And Capital Lease Obligation', 'Current Debt', 'Current Portion Of Long Term Debt']
     
     total_cash = get_bs_value(bs, cash_keys)
+    if total_cash == 0: total_cash = float(info.get('totalCash') or 0.0)
     adjusted_long_debt = get_bs_value(bs, long_debt_keys)
     
-    if total_cash == 0:
-        total_cash = float(info.get('totalCash') or 0.0)
-        
     net_cash = total_cash - adjusted_long_debt
     net_cash_per_share = net_cash / shares
     net_cash_ratio = (net_cash_per_share / price) * 100
@@ -205,98 +164,124 @@ def calculate_single_stock_lynch_model(tk):
                 if len(ni_series) > 1:
                     ni_list = ni_series.tolist()
                     for i in range(len(ni_list) - 1):
-                        if ni_list[i] > ni_list[i+1]:
-                            consecutive_growth += 1
-                        else:
-                            break
+                        if ni_list[i] > ni_list[i+1]: consecutive_growth += 1
+                        else: break
                 break
     growth_str = '▲' * consecutive_growth if consecutive_growth > 0 else '-'
 
-    trailing_pe = info.get('trailingPE', 0)
-    forward_pe = info.get('forwardPE', 0)
-    eps = info.get('trailingEps', 0)
-    
-    if eps and eps > 0:
-        net_cash_per = (price - net_cash_per_share) / eps
-    else:
-        net_cash_per = 0.0
+    trailing_pe, forward_pe, eps = info.get('trailingPE', 0), info.get('forwardPE', 0), info.get('trailingEps', 0)
+    net_cash_per = (price - net_cash_per_share) / eps if eps and eps > 0 else 0.0
     
     return {
-        '종목': tk,
-        '기업명': c_name,
-        '섹터': sector,
-        '현재주가($)': price,
-        '주당순현금($)': round(net_cash_per_share, 2),
-        '순현금비율(%)': round(net_cash_ratio, 2),
-        '시가총액(M$)': round(market_cap / 1e6, 2) if market_cap else 0.0,
-        '총현금(M$)': round(total_cash / 1e6, 2),
-        '실질장기부채(M$)': round(adjusted_long_debt / 1e6, 2),
-        '순이익성장': growth_str,
+        '종목': tk, '기업명': info.get('shortName', info.get('longName', tk)), '섹터': sector,
+        '현재주가($)': price, '주당순현금($)': round(net_cash_per_share, 2), '순현금비율(%)': round(net_cash_ratio, 2),
+        '시가총액(M$)': round(market_cap / 1e6, 2) if market_cap else 0.0, '총현금(M$)': round(total_cash / 1e6, 2),
+        '실질장기부채(M$)': round(adjusted_long_debt / 1e6, 2), '순이익성장': growth_str,
         'PER': round(trailing_pe, 2) if trailing_pe and trailing_pe > 0 else 0.0,
         'Fwd_PER': round(forward_pe, 2) if forward_pe and forward_pe > 0 else 0.0,
         '순현금_PER': round(net_cash_per, 2)
     }
 
-def process_market_data(mode="sp1500"):
-    """
-    mode: 'sp1500' 또는 'full'
-    """
+def process_market_data(mode="sp1500", resume=False):
     if mode == "full":
         tickers = get_us_full_tickers()
+        expected_time = "1~2시간"
     else:
         tickers = fetch_sp1500_tickers()
+        expected_time = "10~15분"
         
-    if not tickers:
-        raise ValueError("티커 목록을 가져오지 못했습니다. 네트워크 상태를 확인하세요.")
+    if not tickers: raise ValueError("티커 목록을 가져오지 못했습니다.")
+
+    existing_df = None
+    processed_tickers = set()
+    
+    # 💡 [핵심] 이어서 수집(Resume) 옵션이 켜져있을 경우 기존 티커 목록 제외
+    if resume and st.session_state.get('quant_data') is not None:
+        existing_df = st.session_state['quant_data'].copy()
+        if '종목' in existing_df.columns:
+            processed_tickers = set(existing_df['종목'].tolist())
+    
+    tickers_to_process = [tk for tk in tickers if tk not in processed_tickers]
+    total = len(tickers_to_process)
+    
+    if total == 0:
+        return existing_df, st.session_state.get('sector_per_map', {}), st.session_state.get('last_updated', ''), "✅ 이미 모든 종목이 스크래핑 되어있습니다."
 
     temp_list = []
     progress_bar = st.progress(0)
     status_text = st.empty()
-    total = len(tickers)
     
-    error_streak = 0 # 연속 에러 카운터 (야후 밴 방어용)
+    error_streak = 0
+    interrupted = False
+    start_time = time.time()
 
-    for i, tk in enumerate(tickers, 1):
-        time.sleep(0.05) # 차단 회피 매너 타임
+    for i, tk in enumerate(tickers_to_process, 1):
+        time.sleep(0.05) 
         try:
             raw_data = calculate_single_stock_lynch_model(tk)
-            if raw_data:
-                temp_list.append(raw_data)
-                error_streak = 0
+            if raw_data: temp_list.append(raw_data)
+            error_streak = 0 # 성공하면 에러 카운터 초기화
         except Exception as e:
             logger.warning(f"Error fetching {tk}: {e}")
-            error_streak += 1
-            pass
-            
-        # UI 부하를 줄이기 위해 간헐적 업데이트
-        if i % 10 == 0 or i == total:
+            error_streak += 1 # 실패하면 누적
+        
+        # 💡 [UI 디테일] 예상 소요시간과 현재 진행 시간 표기
+        if i % 5 == 0 or i == total:
             progress_bar.progress(i / total)
-            status_text.text(f"API 통신 중... ({i}/{total}) | 현재 확보: {len(temp_list)}종목")
+            elapsed = int(time.time() - start_time)
+            m, s = divmod(elapsed, 60)
+            status_text.text(f"수집 중: {i}/{total}개 | 신규 확보: {len(temp_list)}개 | 예상: {expected_time} | 소요시간: {m}분 {s}초")
             
-        # 야후 서버에서 연속으로 100번 이상 차단당하면 즉시 루프 중단 (Graceful Stop)
-        if error_streak > 100:
-            status_text.text(f"🚨 야후 파이낸스 접속 차단 감지! 현재까지 수집된 {len(temp_list)}개 종목으로 비상 저장합니다.")
+        # 💡 [핵심] 야후 차단 감지 로직 (30번 연속 에러 발생 시 강제 비상 정지)
+        if error_streak >= 30:
+            interrupted = True
             break
+
+    elapsed = int(time.time() - start_time)
+    m, s = divmod(elapsed, 60)
+    elapsed_str = f"{m}분 {s}초"
 
     progress_bar.empty()
     status_text.empty()
 
-    if len(temp_list) == 0:
-        raise ValueError("야후 파이낸스 서버가 접근을 전면 차단하여 데이터를 가져오지 못했습니다.")
+    new_df = pd.DataFrame(temp_list)
+    
+    # 기존 데이터와 신규 데이터 병합
+    if existing_df is not None and not existing_df.empty:
+        if not new_df.empty:
+            if '순위' in existing_df.columns: existing_df = existing_df.drop(columns=['순위'])
+            if '순위' in new_df.columns: new_df = new_df.drop(columns=['순위'])
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        else: combined_df = existing_df
+    else:
+        combined_df = new_df
 
-    df = pd.DataFrame(temp_list).replace([np.inf, -np.inf], 0).fillna(0)
+    if combined_df.empty:
+        raise ValueError("수집된 데이터가 없습니다. 야후 서버 차단을 의심해보세요.")
+
+    # 섹터 평균 PER 재계산
+    if 'PER' in combined_df.columns and '섹터' in combined_df.columns:
+        valid_per_df = combined_df[combined_df['PER'] > 0]
+        sector_per_map = valid_per_df.groupby('섹터')['PER'].mean().round(1).to_dict()
+        combined_df['섹터평균_PER'] = combined_df['섹터'].map(sector_per_map).fillna(0.0)
+    else: sector_per_map = {}
     
-    valid_per_df = df[df['PER'] > 0]
-    sector_per_map = valid_per_df.groupby('섹터')['PER'].mean().round(1).to_dict()
-    df['섹터평균_PER'] = df['섹터'].map(sector_per_map).fillna(0.0)
-    
-    df = df.sort_values('순현금비율(%)', ascending=False).reset_index(drop=True)
-    df.insert(0, '순위', range(1, len(df) + 1))
+    # 랭킹 재정렬
+    combined_df = combined_df.sort_values('순현금비율(%)', ascending=False).reset_index(drop=True)
+    if '순위' in combined_df.columns: combined_df = combined_df.drop(columns=['순위'])
+    combined_df.insert(0, '순위', range(1, len(combined_df) + 1))
     
     kst = pytz.timezone('Asia/Seoul')
     update_time = datetime.datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S KST')
     
-    return df, sector_per_map, update_time
+    # 💡 [핵심] 영구 보존용 메세지 생성
+    added_count = len(temp_list)
+    if interrupted:
+        msg = f"🚨 야후 차단 감지! 임시 저장됨. (이번 턴에 추가된 종목: {added_count}개 | 남은 종목: {total - i}개 | 진행시간: {elapsed_str}) ➡️ 잠시 후 [이어서 수집] 버튼을 눌러주세요."
+    else:
+        msg = f"✅ 수집 완료! (이번 턴에 추가된 종목: {added_count}개 | 진행시간: {elapsed_str})"
+        
+    return combined_df, sector_per_map, update_time, msg
 
 # =============================================================================
 # 6. 세션 상태 및 라우팅 컨트롤러
@@ -305,6 +290,7 @@ if 'quant_data' not in st.session_state:
     st.session_state['quant_data'] = None
     st.session_state['sector_per_map'] = {}
     st.session_state['last_updated'] = "수집 전"
+    st.session_state['scan_msg'] = "" # 영구 알림 메세지 저장소
     
     global_data = load_global_data()
     if global_data is not None:
@@ -312,58 +298,77 @@ if 'quant_data' not in st.session_state:
         st.session_state['sector_per_map'] = global_data.get('sector_per_map', {})
         st.session_state['last_updated'] = global_data['updated_time']
 
-if 'is_admin' not in st.session_state: 
-    st.session_state['is_admin'] = False
+if 'is_admin' not in st.session_state: st.session_state['is_admin'] = False
+if st.query_params.get("admin") == ADMIN_SECRET_CODE: st.session_state['is_admin'] = True
 
-query_params = st.query_params
-if query_params.get("admin") == ADMIN_SECRET_CODE:
-    st.session_state['is_admin'] = True
-
+# 최초 데이터 없을 때의 관리자 화면
 if st.session_state['quant_data'] is None:
     if st.session_state['is_admin']:
         st.title("🛠️ 데이터 수집 센터")
-        st.info("현재 서버에 랭킹 데이터가 없습니다. 원하시는 스캐닝 방식을 선택하세요.")
-
+        
+        # 알림 메세지 영구 노출 (수집 멈췄을 때 원인 파악용)
+        if st.session_state['scan_msg']:
+            if "완료" in st.session_state['scan_msg']: st.success(st.session_state['scan_msg'])
+            else: st.warning(st.session_state['scan_msg'])
+            
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("1️⃣ S&P 1500 안전 스캐닝")
-            st.caption("소요시간 약 10~15분. IP 차단 확률 낮음.")
-            if st.button("🚀 S&P 1500 실시간 스크래핑", use_container_width=True):
-                with st.spinner("야후 파이낸스에서 안전하게 수집 중..."):
-                    try:
-                        df, sector_map, updated_time = process_market_data(mode="sp1500")
-                        save_global_data(df, sector_map, updated_time)
-                        st.session_state['quant_data'] = df
-                        st.session_state['sector_per_map'] = sector_map
-                        st.session_state['last_updated'] = updated_time
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"에러 발생: {e}")
-                        
+            st.subheader("1️⃣ S&P 1500 (대/중/소형주)")
+            st.caption("예상 시간: 10~15분. 상대적으로 차단 확률 낮음.")
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("🚀 전체 새로 수집", key="sp_new"):
+                    with st.spinner("S&P 1500 전체 수집 중..."):
+                        try:
+                            df, sector_map, updated_time, msg = process_market_data(mode="sp1500", resume=False)
+                            save_global_data(df, sector_map, updated_time)
+                            st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
+                            st.session_state['last_updated'], st.session_state['scan_msg'] = updated_time, msg
+                            st.rerun()
+                        except Exception as e: st.error(f"에러: {e}")
+            with c2:
+                if st.button("⏯️ 이어서 수집", key="sp_res"):
+                    with st.spinner("S&P 1500 남은 종목 수집 중..."):
+                        try:
+                            df, sector_map, updated_time, msg = process_market_data(mode="sp1500", resume=True)
+                            save_global_data(df, sector_map, updated_time)
+                            st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
+                            st.session_state['last_updated'], st.session_state['scan_msg'] = updated_time, msg
+                            st.rerun()
+                        except Exception as e: st.error(f"에러: {e}")
+
         with col2:
-            st.subheader("2️⃣ 미국 전체(6,000+) 하드코어 스캐닝")
-            st.caption("⚠️ 소요시간 1~2시간. 클라우드 환경 시 타임아웃/IP 밴 위험.")
-            if st.button("🔥 미국 전 종목 6000+ 스크래핑", type="primary", use_container_width=True):
-                with st.spinner("미국 전체 주식 전수 조사 중! 화면을 끄지 마세요..."):
-                    try:
-                        df, sector_map, updated_time = process_market_data(mode="full")
-                        save_global_data(df, sector_map, f"{updated_time} (전수조사)")
-                        st.session_state['quant_data'] = df
-                        st.session_state['sector_per_map'] = sector_map
-                        st.session_state['last_updated'] = f"{updated_time} (전수조사)"
-                        st.success("미국 전 증시 스캐닝 완료!")
-                        time.sleep(2)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"전수조사 에러: {e}")
-        
-        st.markdown("<br><br><br><div style='text-align: center; color: #888; font-size: 12px;'>powered by TeamChilli</div>", unsafe_allow_html=True)
+            st.subheader("2️⃣ 미국 전체 주식 (6,000+)")
+            st.caption("예상 시간: 1~2시간. 차단 확률 매우 높음 (이어서 수집 적극 활용)")
+            
+            c3, c4 = st.columns(2)
+            with c3:
+                if st.button("🔥 전체 새로 수집", key="us_new", type="primary"):
+                    with st.spinner("미국 전체 주식 수집 중..."):
+                        try:
+                            df, sector_map, updated_time, msg = process_market_data(mode="full", resume=False)
+                            save_global_data(df, sector_map, f"{updated_time} (전수)")
+                            st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
+                            st.session_state['last_updated'], st.session_state['scan_msg'] = f"{updated_time} (전수)", msg
+                            st.rerun()
+                        except Exception as e: st.error(f"에러: {e}")
+            with c4:
+                if st.button("⏯️ 이어서 수집", key="us_res", type="primary"):
+                    with st.spinner("미국 전체 주식 남은 종목 수집 중..."):
+                        try:
+                            df, sector_map, updated_time, msg = process_market_data(mode="full", resume=True)
+                            save_global_data(df, sector_map, f"{updated_time} (전수)")
+                            st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
+                            st.session_state['last_updated'], st.session_state['scan_msg'] = f"{updated_time} (전수)", msg
+                            st.rerun()
+                        except Exception as e: st.error(f"에러: {e}")
+
         st.stop()
         
     else:
         st.title("💰 피터 린치 주당 순현금 랭킹")
-        st.info("관리자가 API를 통해 실시간 마켓 데이터를 수집하고 있습니다. 잠시 후 다시 접속해 주세요.")
-        st.markdown("<br><br><br><div style='text-align: center; color: #888; font-size: 12px;'>powered by TeamChilli</div>", unsafe_allow_html=True)
+        st.info("관리자가 실시간 마켓 데이터를 수집하고 있습니다. 잠시 후 다시 접속해 주세요.")
         st.stop()
 
 # =============================================================================
@@ -383,56 +388,69 @@ with tab1:
     * **순현금 공식:** (순수 현금 및 단기투자자산) - (순수 장기 부채 및 1년 내 만기도래분)
     * **순현금 PER:** (현재 주가 - 주당 순현금) / 1주당 순이익(EPS)
     * **섹터 평균 PER:** 해당 업종 내 **흑자 기업(EPS > 0)**의 PER 평균값
-    
-    영업을 위한 단기 외상값이나 가짜 부채(매장 리스 등)는 제외하고, 최신 분기 금고의 현금성 자산에서 
-    은행 빚을 털어낸 오리지널 공식을 적용합니다. 
     ''')
     st.divider()
     
     if st.session_state['is_admin']:
         st.markdown("### 🛠️ [관리자 전용] 데이터 갱신 패널")
+        
+        if st.session_state['scan_msg']:
+            if "완료" in st.session_state['scan_msg']: st.success(st.session_state['scan_msg'])
+            else: st.warning(st.session_state['scan_msg'])
+            
         col1, col2 = st.columns(2)
         with col1:
-            st.markdown("##### 🚀 S&P 1500 안전 스캐닝")
-            if st.button("야후 API 1,500종목 강제 재수집", use_container_width=True):
-                with st.spinner("야후 서버에서 S&P 1500 데이터를 다시 긁어오는 중..."):
-                    try:
-                        df, sector_map, updated_time = process_market_data(mode="sp1500")
-                        save_global_data(df, sector_map, updated_time)
-                        st.session_state['quant_data'] = df
-                        st.session_state['sector_per_map'] = sector_map
-                        st.session_state['last_updated'] = updated_time
-                        st.success("데이터가 갱신되었습니다.")
-                        time.sleep(1)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"통신 실패: {e}")
+            st.markdown("##### 🚀 S&P 1500 (예상: 10~15분)")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("새로 수집", key="sp_new_2", use_container_width=True):
+                    with st.spinner("S&P 1500 전체 다시 수집 중..."):
+                        try:
+                            df, sector_map, updated_time, msg = process_market_data(mode="sp1500", resume=False)
+                            save_global_data(df, sector_map, updated_time)
+                            st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
+                            st.session_state['last_updated'], st.session_state['scan_msg'] = updated_time, msg
+                            st.rerun()
+                        except Exception as e: st.error(f"에러: {e}")
+            with c2:
+                if st.button("⏯️ 이어서 수집", key="sp_res_2", use_container_width=True):
+                    with st.spinner("S&P 1500 남은 종목 수집 중..."):
+                        try:
+                            df, sector_map, updated_time, msg = process_market_data(mode="sp1500", resume=True)
+                            save_global_data(df, sector_map, updated_time)
+                            st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
+                            st.session_state['last_updated'], st.session_state['scan_msg'] = updated_time, msg
+                            st.rerun()
+                        except Exception as e: st.error(f"에러: {e}")
+
         with col2:
-            st.markdown("##### 🔥 미국 전체(6,000+) 스캐닝")
-            if st.button("미국 전 종목 6000+ 스크래핑", type="primary", use_container_width=True):
-                with st.spinner("미국 전체 주식 전수 조사 중! 화면을 끄지 마세요..."):
-                    try:
-                        df, sector_map, updated_time = process_market_data(mode="full")
-                        save_global_data(df, sector_map, f"{updated_time} (전수조사)")
-                        st.session_state['quant_data'] = df
-                        st.session_state['sector_per_map'] = sector_map
-                        st.session_state['last_updated'] = f"{updated_time} (전수조사)"
-                        st.success("전수조사 완료!")
-                        time.sleep(1)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"통신 실패: {e}")
+            st.markdown("##### 🔥 미국 전체 6000+ (예상: 1~2시간)")
+            c3, c4 = st.columns(2)
+            with c3:
+                if st.button("새로 수집", key="us_new_2", type="primary", use_container_width=True):
+                    with st.spinner("미국 전체 주식 처음부터 수집 중..."):
+                        try:
+                            df, sector_map, updated_time, msg = process_market_data(mode="full", resume=False)
+                            save_global_data(df, sector_map, f"{updated_time} (전수)")
+                            st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
+                            st.session_state['last_updated'], st.session_state['scan_msg'] = f"{updated_time} (전수)", msg
+                            st.rerun()
+                        except Exception as e: st.error(f"에러: {e}")
+            with c4:
+                if st.button("⏯️ 이어서 수집", key="us_res_2", type="primary", use_container_width=True):
+                    with st.spinner("미국 전체 주식 남은 종목 수집 중..."):
+                        try:
+                            df, sector_map, updated_time, msg = process_market_data(mode="full", resume=True)
+                            save_global_data(df, sector_map, f"{updated_time} (전수)")
+                            st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
+                            st.session_state['last_updated'], st.session_state['scan_msg'] = f"{updated_time} (전수)", msg
+                            st.rerun()
+                        except Exception as e: st.error(f"에러: {e}")
         
         st.markdown("---")
         if st.session_state['quant_data'] is not None:
             csv_data = st.session_state['quant_data'].to_csv(index=False).encode('utf-8-sig')
-            st.download_button(
-                label="📥 현재 DB 로컬 다운로드 (CSV 백업용)", 
-                data=csv_data, 
-                file_name=f"PeterLynch_NetCash_{datetime.datetime.now().strftime('%Y%m%d')}.csv", 
-                mime="text/csv", 
-                use_container_width=True
-            )
+            st.download_button("📥 현재 완성된 DB 로컬 다운로드 (CSV 백업용)", data=csv_data, file_name=f"PeterLynch_NetCash_Backup_{datetime.datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
 
 with tab2:
     st.subheader("🏆 순현금비율(%) TOP 100")
@@ -445,14 +463,12 @@ with tab2:
             'PER', 'Fwd_PER', '순현금_PER', '섹터평균_PER', '순이익성장', 
             '현재주가($)', '주당순현금($)', '총현금(M$)', '실질장기부채(M$)'
         ]
-        
         for c in display_cols:
             if c not in df.columns: df[c] = 0.0
         
         st.dataframe(
             df[display_cols].head(100),
-            use_container_width=True,
-            hide_index=True,
+            use_container_width=True, hide_index=True,
             column_config={
                 "순위": st.column_config.NumberColumn(width=50, format="%d"),
                 "종목": st.column_config.TextColumn(width=80),
@@ -462,8 +478,8 @@ with tab2:
                 "순현금비율(%)": st.column_config.ProgressColumn(format="%d%%", min_value=0, max_value=100),
                 "PER": st.column_config.NumberColumn(format="%,.1f"),
                 "Fwd_PER": st.column_config.NumberColumn(format="%,.1f"),
-                "순현금_PER": st.column_config.NumberColumn(format="%,.1f", help="(현재 주가 - 주당 순현금) / EPS"),
-                "섹터평균_PER": st.column_config.NumberColumn(format="%,.1f", help="해당 섹터 내 흑자 기업의 평균 PER"),
+                "순현금_PER": st.column_config.NumberColumn(format="%,.1f", help="(주가 - 주당 순현금) / EPS"),
+                "섹터평균_PER": st.column_config.NumberColumn(format="%,.1f", help="섹터 내 흑자 기업 평균 PER"),
                 "순이익성장": st.column_config.TextColumn(width=80, help="연간 순이익 연속 상승 횟수 (▲)"),
                 "현재주가($)": st.column_config.NumberColumn(format="$%,.2f"),
                 "주당순현금($)": st.column_config.NumberColumn(format="$%,.2f"),
@@ -475,7 +491,7 @@ with tab2:
 with tab3:
     st.subheader("🔍 개별 종목 실시간 딥다이브")
     with st.form("search_form"):
-        ticker_input = st.text_input("분석할 티커를 입력하세요 (예: YELP, AAPL, GOOGL)")
+        ticker_input = st.text_input("분석할 티커를 입력하세요 (예: YELP, AAPL)")
         submit_btn = st.form_submit_button("분석 시작")
         
     if submit_btn and ticker_input:
@@ -485,7 +501,6 @@ with tab3:
         if df is not None and tk in df['종목'].values:
             with st.spinner("DB 로드 중..."):
                 row = df[df['종목'] == tk].iloc[0]
-                
                 price = float(row['현재주가($)'])
                 net_cash_per_share = float(row['주당순현금($)'])
                 ratio = float(row['순현금비율(%)'])
@@ -527,9 +542,7 @@ with tab3:
                         price = raw['현재주가($)']
                         net_cash_per_share = raw['주당순현금($)']
                         ratio = raw['순현금비율(%)']
-                        
-                        sec_per_map = st.session_state.get('sector_per_map', {})
-                        sec_avg_per = sec_per_map.get(raw['섹터'], 0.0)
+                        sec_avg_per = st.session_state.get('sector_per_map', {}).get(raw['섹터'], 0.0)
                         
                         if ratio > 50: summ = "엄청난 수준의 현금을 보유하고 있습니다. 회사 금고의 현금이 주가의 절반 이상을 보증합니다!"
                         elif ratio > 20: summ = "매우 건전한 상태입니다. 든든한 순현금이 하락장을 방어해 줄 것입니다."
