@@ -2,12 +2,10 @@
 ===============================================================================
 Project: SnowBall Quant Terminal (Web Edition)
 Author: TeamChilli
-Version: 11.1 (Smart Resume & Persistent Messaging)
+Version: 11.2 (Smart Resume Bug Fix - Silent Block Detection)
 Description: 
-    - 실시간 예상/현재 소요시간 UI 표기
-    - 야후 API 차단(Too Many Requests) 감지 시 비상 세이브(Graceful Stop) 기능
-    - 남은 종목만 골라내는 '이어서 수집(Resume)' 아키텍처 탑재
-    - 휘발성 알림 대신 session_state 기반 영구 메세지 시스템 적용
+    - 야후 파이낸스의 'Silent Block(에러 없이 None 반환)' 완벽 감지 방어막 추가
+    - 연속 30종목 데이터 누락 시 즉각 IP 차단으로 간주하고 강제 비상 세이브
 ===============================================================================
 """
 
@@ -195,7 +193,7 @@ def process_market_data(mode="sp1500", resume=False):
     existing_df = None
     processed_tickers = set()
     
-    # 💡 [핵심] 이어서 수집(Resume) 옵션이 켜져있을 경우 기존 티커 목록 제외
+    # 이어서 수집(Resume) 켜져있을 경우 완료된 티커 필터링
     if resume and st.session_state.get('quant_data') is not None:
         existing_df = st.session_state['quant_data'].copy()
         if '종목' in existing_df.columns:
@@ -219,20 +217,22 @@ def process_market_data(mode="sp1500", resume=False):
         time.sleep(0.05) 
         try:
             raw_data = calculate_single_stock_lynch_model(tk)
-            if raw_data: temp_list.append(raw_data)
-            error_streak = 0 # 성공하면 에러 카운터 초기화
+            if raw_data: 
+                temp_list.append(raw_data)
+                error_streak = 0 # 정상 수집 성공 시 에러(차단) 카운터 리셋
+            else:
+                error_streak += 1 # 💡 [버그 픽스] 데이터가 비어있어도 차단 누적으로 간주!
         except Exception as e:
             logger.warning(f"Error fetching {tk}: {e}")
-            error_streak += 1 # 실패하면 누적
+            error_streak += 1 # 💡 에러가 나도 차단 누적으로 간주!
         
-        # 💡 [UI 디테일] 예상 소요시간과 현재 진행 시간 표기
         if i % 5 == 0 or i == total:
             progress_bar.progress(i / total)
             elapsed = int(time.time() - start_time)
             m, s = divmod(elapsed, 60)
             status_text.text(f"수집 중: {i}/{total}개 | 신규 확보: {len(temp_list)}개 | 예상: {expected_time} | 소요시간: {m}분 {s}초")
             
-        # 💡 [핵심] 야후 차단 감지 로직 (30번 연속 에러 발생 시 강제 비상 정지)
+        # 💡 [핵심 보완] 야후 'Silent Block' 감지 (연속 30번 누락 시 즉각 멈춤)
         if error_streak >= 30:
             interrupted = True
             break
@@ -274,10 +274,9 @@ def process_market_data(mode="sp1500", resume=False):
     kst = pytz.timezone('Asia/Seoul')
     update_time = datetime.datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S KST')
     
-    # 💡 [핵심] 영구 보존용 메세지 생성
     added_count = len(temp_list)
     if interrupted:
-        msg = f"🚨 야후 차단 감지! 임시 저장됨. (이번 턴에 추가된 종목: {added_count}개 | 남은 종목: {total - i}개 | 진행시간: {elapsed_str}) ➡️ 잠시 후 [이어서 수집] 버튼을 눌러주세요."
+        msg = f"🚨 야후 IP 차단 감지! 임시 저장됨. (이번 턴에 추가된 종목: {added_count}개 | 남은 종목: {total - i}개 | 진행시간: {elapsed_str}) ➡️ IP 차단이 풀린 후 다시 [이어서 수집] 버튼을 눌러주세요."
     else:
         msg = f"✅ 수집 완료! (이번 턴에 추가된 종목: {added_count}개 | 진행시간: {elapsed_str})"
         
@@ -301,12 +300,10 @@ if 'quant_data' not in st.session_state:
 if 'is_admin' not in st.session_state: st.session_state['is_admin'] = False
 if st.query_params.get("admin") == ADMIN_SECRET_CODE: st.session_state['is_admin'] = True
 
-# 최초 데이터 없을 때의 관리자 화면
 if st.session_state['quant_data'] is None:
     if st.session_state['is_admin']:
         st.title("🛠️ 데이터 수집 센터")
         
-        # 알림 메세지 영구 노출 (수집 멈췄을 때 원인 파악용)
         if st.session_state['scan_msg']:
             if "완료" in st.session_state['scan_msg']: st.success(st.session_state['scan_msg'])
             else: st.warning(st.session_state['scan_msg'])
@@ -394,9 +391,10 @@ with tab1:
     if st.session_state['is_admin']:
         st.markdown("### 🛠️ [관리자 전용] 데이터 갱신 패널")
         
+        # 💡 [UI 보완] 성공/경고 메세지를 영구적으로 박제 (사라지지 않음)
         if st.session_state['scan_msg']:
             if "완료" in st.session_state['scan_msg']: st.success(st.session_state['scan_msg'])
-            else: st.warning(st.session_state['scan_msg'])
+            else: st.error(st.session_state['scan_msg'])
             
         col1, col2 = st.columns(2)
         with col1:
