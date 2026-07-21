@@ -1,3 +1,15 @@
+"""
+===============================================================================
+Project: SnowBall Quant Terminal (Web Edition)
+Author: TeamChilli
+Version: 10.3 (Lynch Net Cash - Precision & UI Final)
+Description: 
+    - 리스 부채 등 회계 노이즈를 완벽히 제거한 순수 현금/부채 추출
+    - 천 단위 콤마(,) 렌더링 및 PER 3종 세트 테이블 편입
+    - 순위 칼럼 최소화 및 컨테이너 핏 최적화
+===============================================================================
+"""
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -70,6 +82,7 @@ def get_trade_day():
     return now.strftime('%Y-%m-%d')
 
 def get_bs_value(bs, possible_keys):
+    """지정된 정확한 키값만 순차적으로 찾아 반환 (노이즈 배제)"""
     if bs.empty: return 0
     recent_bs = bs.iloc[:, 0]
     for key in possible_keys:
@@ -80,7 +93,7 @@ def get_bs_value(bs, possible_keys):
     return 0
 
 # =============================================================================
-# 4. 피터 린치 코어 엔진 (API 실시간 수집 및 순현금 산출)
+# 4. 피터 린치 코어 엔진
 # =============================================================================
 def fetch_sp1500_tickers():
     logger.info("Fetching S&P 1500 tickers from Wikipedia...")
@@ -112,7 +125,7 @@ def calculate_single_stock_lynch_model(tk):
         return None
         
     bs = s.balance_sheet
-    inc = s.financials # 손익계산서 (연간 순이익 확인용)
+    inc = s.financials
     
     price = info.get('currentPrice') or info.get('previousClose')
     shares = info.get('impliedSharesOutstanding') or info.get('sharesOutstanding')
@@ -122,27 +135,31 @@ def calculate_single_stock_lynch_model(tk):
         
     c_name = info.get('shortName', info.get('longName', tk))
     
-    # 1. 피터 린치 순현금 산출 (Million 달러 단위 조정)
-    cash = get_bs_value(bs, ['Cash And Cash Equivalents', 'Cash', 'Cash & Cash Equivalents'])
-    short_inv = get_bs_value(bs, ['Other Short Term Investments', 'Short Term Investments'])
+    # -------------------------------------------------------------------------
+    # 💡 [노이즈 완전 제거] 현금 및 부채 핀셋 추출 (리스 부채 제외)
+    # -------------------------------------------------------------------------
+    # 가장 순수한 '현금 및 현금성 자산'과 '단기 투자'만 포함
+    cash = get_bs_value(bs, ['Cash And Cash Equivalents'])
+    short_inv = get_bs_value(bs, ['Other Short Term Investments'])
     total_cash = cash + short_inv
     
-    long_debt = get_bs_value(bs, ['Long Term Debt', 'Long-Term Debt', 'Total Long Term Debt'])
-    current_long_debt = get_bs_value(bs, ['Current Debt', 'Current Portion Of Long Term Debt', 'Current Debt And Capital Lease Obligation', 'Short Long Term Debt'])
+    # 리스 부채(Lease Obligation)가 포함된 항목을 철저히 배제하고 '순수 은행 부채'만 포함
+    long_debt = get_bs_value(bs, ['Long Term Debt'])
+    current_long_debt = get_bs_value(bs, ['Current Debt', 'Current Portion Of Long Term Debt'])
     adjusted_long_debt = long_debt + current_long_debt
     
     net_cash = total_cash - adjusted_long_debt
     net_cash_per_share = net_cash / shares
     net_cash_ratio = (net_cash_per_share / price) * 100
     
-    # 2. 연간 순이익(Net Income) 연속 성장 체크 (▲ 기호)
+    # 순이익 연속 성장(▲) 로직
     consecutive_growth = 0
     if not inc.empty:
-        for key in ['Net Income', 'Net Income Common Stockholders', 'Net Income From Continuing Operations']:
+        for key in ['Net Income', 'Net Income Common Stockholders']:
             if key in inc.index:
                 ni_series = inc.loc[key].dropna()
                 if len(ni_series) > 1:
-                    ni_list = ni_series.tolist() # 인덱스 0이 가장 최근 연도
+                    ni_list = ni_series.tolist()
                     for i in range(len(ni_list) - 1):
                         if ni_list[i] > ni_list[i+1]:
                             consecutive_growth += 1
@@ -151,12 +168,11 @@ def calculate_single_stock_lynch_model(tk):
                 break
     growth_str = '▲' * consecutive_growth if consecutive_growth > 0 else '-'
 
-    # 3. PER 지표 3종 세트 산출
+    # PER 3종 세트 산출
     trailing_pe = info.get('trailingPE', 0)
     forward_pe = info.get('forwardPE', 0)
     eps = info.get('trailingEps', 0)
     
-    # 💡 순현금 PER: (현재 주가 - 주당 순현금) / EPS
     if eps and eps > 0:
         net_cash_per = (price - net_cash_per_share) / eps
     else:
@@ -274,11 +290,11 @@ with tab1:
     "어떤 회사의 주당 순현금이 3달러이고 주가가 10달러라면, 당신은 이 주식을 10달러가 아니라 **실질적으로 7달러**에 사는 것이다." 
     - *피터 린치 (Peter Lynch)*
     
-    * **순현금 공식:** (현금 및 단기투자자산) - (장기 부채 + 1년 내 만기도래 장기부채)
+    * **순현금 공식:** (순수 현금 및 단기투자자산) - (순수 장기 부채 및 1년 내 만기도래분)
     * **순현금 PER:** (현재 주가 - 주당 순현금) / 1주당 순이익(EPS)
     
-    영업을 위한 단기적인 외상값은 무시하고, 금고에 당장 현금화할 수 있는 자산에서 은행 빚을 
-    모두 털어낸 오리지널 공식을 사용합니다. 겉으로 보이는 PER에 속지 마시고, 
+    영업을 위한 단기적인 외상값이나 가짜 부채(매장 리스 등)는 무시하고, 금고에 당장 현금화할 수 있는 자산에서 은행 빚을 
+    모두 털어낸 깐깐한 오리지널 공식을 사용합니다. 겉으로 보이는 PER에 속지 마시고, 
     기업의 알짜 현금을 차감한 **'순현금 PER'**을 통해 숨겨진 저평가 기업을 발굴하세요.
     ''')
     st.divider()
@@ -316,27 +332,26 @@ with tab2:
         df = st.session_state['quant_data'].copy()
         df = df[df['순현금비율(%)'] > 0] 
         
-        display_cols = ['순위', '종목', '기업명', '순현금비율(%)', '순현금_PER', '순이익성장', '현재주가($)', '주당순현금($)', '총현금(M$)', '실질장기부채(M$)']
+        display_cols = ['순위', '종목', '기업명', '순현금비율(%)', 'PER', 'Fwd_PER', '순현금_PER', '순이익성장', '현재주가($)', '주당순현금($)', '총현금(M$)', '실질장기부채(M$)']
         
+        # 💡 [UI 업데이트] 천 단위 콤마 렌더링 및 칼럼 폭 최적화
         st.dataframe(
             df[display_cols].head(100),
             use_container_width=True,
             hide_index=True,
             column_config={
-                "순위": st.column_config.NumberColumn(width="small"),
-                "종목": st.column_config.TextColumn(width="small"),
+                "순위": st.column_config.NumberColumn(width=50, format="%d"),
+                "종목": st.column_config.TextColumn(width=80),
                 "기업명": st.column_config.TextColumn(width="medium"),
-                "순이익성장": st.column_config.TextColumn(width="small", help="연간 순이익 연속 상승 횟수 (▲)"),
-                "현재주가($)": st.column_config.NumberColumn(format="$%.2f"),
-                "주당순현금($)": st.column_config.NumberColumn(format="$%.2f"),
-                "순현금_PER": st.column_config.NumberColumn(format="%.1f", help="(현재 주가 - 주당 순현금) / EPS"),
-                "순현금비율(%)": st.column_config.ProgressColumn(
-                    format="%d%%",
-                    min_value=0,
-                    max_value=100
-                ),
-                "총현금(M$)": st.column_config.NumberColumn(format="%.1f M"),
-                "실질장기부채(M$)": st.column_config.NumberColumn(format="%.1f M")
+                "순현금비율(%)": st.column_config.ProgressColumn(format="%d%%", min_value=0, max_value=100),
+                "PER": st.column_config.NumberColumn(format="%,.1f"),
+                "Fwd_PER": st.column_config.NumberColumn(format="%,.1f"),
+                "순현금_PER": st.column_config.NumberColumn(format="%,.1f", help="(현재 주가 - 주당 순현금) / EPS"),
+                "순이익성장": st.column_config.TextColumn(width=80, help="연간 순이익 연속 상승 횟수 (▲)"),
+                "현재주가($)": st.column_config.NumberColumn(format="$%,.2f"),
+                "주당순현금($)": st.column_config.NumberColumn(format="$%,.2f"),
+                "총현금(M$)": st.column_config.NumberColumn(format="%,.1f M"),
+                "실질장기부채(M$)": st.column_config.NumberColumn(format="%,.1f M")
             }
         )
 
@@ -363,23 +378,24 @@ with tab3:
                 elif ratio > 0: summ = "실질 장기부채보다 현금이 더 많아 재무적으로 안정적입니다."
                 else: summ = "현재 보유한 현금보다 갚아야 할 실질 장기부채가 더 많아 주당 순현금이 마이너스(-) 상태입니다."
 
-                st.success(f"### {row['기업명']} ({tk}) : 순현금비율 {ratio}%")
+                st.success(f"### {row['기업명']} ({tk}) : 순현금비율 {ratio:,.1f}%")
                 st.caption(f"섹터: {row['섹터']} | 랭킹: 비금융 전체 {row['순위']}위")
                 st.info(f"💡 총평: {summ}")
                 
+                # 💡 [UI 업데이트] 개별 종목 분석 패널 천 단위 콤마 반영
                 col1, col2, col3 = st.columns(3)
-                col1.metric("현재 주가", f"${price:.2f}")
-                col2.metric("주당 순현금", f"${net_cash_per_share:.2f}", f"{ratio}% of Price")
-                col3.metric("실질 매수단가", f"${max(0, price - net_cash_per_share):.2f}", delta_color="inverse")
+                col1.metric("현재 주가", f"${price:,.2f}")
+                col2.metric("주당 순현금", f"${net_cash_per_share:,.2f}", f"{ratio:,.1f}% of Price")
+                col3.metric("실질 매수단가", f"${max(0, price - net_cash_per_share):,.2f}", delta_color="inverse")
                 
                 col4, col5, col6 = st.columns(3)
-                col4.metric("PER (기본)", f"{row['PER']:.1f}" if row['PER'] > 0 else "N/A")
-                col5.metric("Forward PER", f"{row['Fwd_PER']:.1f}" if row['Fwd_PER'] > 0 else "N/A")
-                col6.metric("순현금 PER", f"{row['순현금_PER']:.1f}" if row['순현금_PER'] > 0 else "N/A", help="실질 매수단가 / EPS")
+                col4.metric("PER (기본)", f"{row['PER']:,.1f}" if row['PER'] > 0 else "N/A")
+                col5.metric("Forward PER", f"{row['Fwd_PER']:,.1f}" if row['Fwd_PER'] > 0 else "N/A")
+                col6.metric("순현금 PER", f"{row['순현금_PER']:,.1f}" if row['순현금_PER'] > 0 else "N/A", help="실질 매수단가 / EPS")
                 
                 col7, col8, col9 = st.columns(3)
-                col7.metric("총 현금 (Total Cash)", f"${row['총현금(M$)']} Million")
-                col8.metric("조정 장기부채 (Long Term)", f"${row['실질장기부채(M$)']} Million")
+                col7.metric("총 현금 (Total Cash)", f"${row['총현금(M$)']:,.1f} M")
+                col8.metric("조정 장기부채 (Long Term)", f"${row['실질장기부채(M$)']:,.1f} M")
                 col9.metric("연간 순이익 성장", row['순이익성장'] if row['순이익성장'] != '-' else "성장 안함")
                 
         else:
@@ -399,23 +415,23 @@ with tab3:
                         elif ratio > 0: summ = "실질 장기부채보다 현금이 더 많아 재무적으로 안정적입니다."
                         else: summ = "현재 보유한 현금보다 갚아야 할 실질 장기부채가 더 많아 주당 순현금이 마이너스(-) 상태입니다."
 
-                        st.success(f"### {raw['기업명']} ({tk}) : 순현금비율 {ratio}%")
+                        st.success(f"### {raw['기업명']} ({tk}) : 순현금비율 {ratio:,.1f}%")
                         st.caption(f"섹터: {raw['섹터']} | (실시간 산출 데이터)")
                         st.info(f"💡 총평: {summ}")
                         
                         col1, col2, col3 = st.columns(3)
-                        col1.metric("현재 주가", f"${price:.2f}")
-                        col2.metric("주당 순현금", f"${net_cash_per_share:.2f}", f"{ratio}% of Price")
-                        col3.metric("실질 매수단가", f"${max(0, price - net_cash_per_share):.2f}", delta_color="inverse")
+                        col1.metric("현재 주가", f"${price:,.2f}")
+                        col2.metric("주당 순현금", f"${net_cash_per_share:,.2f}", f"{ratio:,.1f}% of Price")
+                        col3.metric("실질 매수단가", f"${max(0, price - net_cash_per_share):,.2f}", delta_color="inverse")
                         
                         col4, col5, col6 = st.columns(3)
-                        col4.metric("PER (기본)", f"{raw['PER']:.1f}" if raw['PER'] > 0 else "N/A")
-                        col5.metric("Forward PER", f"{raw['Fwd_PER']:.1f}" if raw['Fwd_PER'] > 0 else "N/A")
-                        col6.metric("순현금 PER", f"{raw['순현금_PER']:.1f}" if raw['순현금_PER'] > 0 else "N/A")
+                        col4.metric("PER (기본)", f"{raw['PER']:,.1f}" if raw['PER'] > 0 else "N/A")
+                        col5.metric("Forward PER", f"{raw['Fwd_PER']:,.1f}" if raw['Fwd_PER'] > 0 else "N/A")
+                        col6.metric("순현금 PER", f"{raw['순현금_PER']:,.1f}" if raw['순현금_PER'] > 0 else "N/A")
                         
                         col7, col8, col9 = st.columns(3)
-                        col7.metric("총 현금 (Total Cash)", f"${raw['총현금(M$)']} Million")
-                        col8.metric("조정 장기부채 (Long Term)", f"${raw['실질장기부채(M$)']} Million")
+                        col7.metric("총 현금 (Total Cash)", f"${raw['총현금(M$)']:,.1f} M")
+                        col8.metric("조정 장기부채 (Long Term)", f"${raw['실질장기부채(M$)']:,.1f} M")
                         col9.metric("연간 순이익 성장", raw['순이익성장'] if raw['순이익성장'] != '-' else "성장 안함")
                         
                 except Exception as e:
