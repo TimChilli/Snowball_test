@@ -2,11 +2,11 @@
 ===============================================================================
 Project: SnowBall Quant Terminal (Web Edition)
 Author: TeamChilli
-Version: 10.0 (Peter Lynch Net Cash Model)
+Version: 10.1 (Lynch Net Cash - Advanced Filter)
 Description: 
-    S&P 1500(대/중/소형주) 대상 피터 린치 주당 순현금 모델 적용.
-    엑셀 업로드 등 수동 개입을 완전히 제거하고 100% Yahoo Finance API 기반 
-    실시간 재무상태표(Balance Sheet) 스크래핑 아키텍처로 전면 개편.
+    - S&P 1500 대상 피터 린치 주당 순현금 모델.
+    - 금융(Financial Services) 및 리츠(Real Estate) 섹터 원천 배제.
+    - 장기부채 + 1년 내 만기 도래 장기부채(Current Portion) 합산 정밀화.
 ===============================================================================
 """
 
@@ -52,12 +52,10 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-
 # =============================================================================
 # 3. 유틸리티 및 데이터 캐싱 함수
 # =============================================================================
 def save_global_data(df, updated_time):
-    """스크래핑한 랭킹 데이터를 서버 내 공용 스토리지에 저장합니다."""
     data = {
         'df': df,
         'updated_time': updated_time
@@ -70,7 +68,6 @@ def save_global_data(df, updated_time):
         logger.error(f"Failed to save global data: {e}")
 
 def load_global_data():
-    """서버 내 공용 스토리지에서 최신 퀀트 데이터를 불러옵니다."""
     if os.path.exists(SHARED_FILE):
         try:
             with open(SHARED_FILE, 'rb') as f:
@@ -81,7 +78,6 @@ def load_global_data():
     return None
 
 def get_trade_day():
-    """미국 동부 시간(EST) 기준 프리장 오픈 시간(새벽 4시)을 계산합니다."""
     tz = pytz.timezone('US/Eastern')
     now = datetime.datetime.now(tz)
     if now.hour < 4:
@@ -89,13 +85,9 @@ def get_trade_day():
     return now.strftime('%Y-%m-%d')
 
 def get_bs_value(bs, possible_keys):
-    """
-    Yahoo Finance 재무상태표(Balance Sheet)에서 계정과목 명칭이 미세하게 
-    다를 경우를 대비하여, 여러 키를 순회하며 안전하게 값을 추출합니다.
-    """
     if bs.empty:
         return 0
-    recent_bs = bs.iloc[:, 0] # 가장 최근 결산 분기/연도 데이터
+    recent_bs = bs.iloc[:, 0]
     for key in possible_keys:
         if key in recent_bs.index:
             val = recent_bs[key]
@@ -103,12 +95,10 @@ def get_bs_value(bs, possible_keys):
                 return float(val)
     return 0
 
-
 # =============================================================================
 # 4. 피터 린치 코어 엔진 (API 실시간 수집 및 순현금 산출)
 # =============================================================================
 def fetch_sp1500_tickers():
-    """위키피디아에서 S&P 500(대), 400(중), 600(소) 티커 1,500개를 스크래핑합니다."""
     logger.info("Fetching S&P 1500 tickers from Wikipedia...")
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
@@ -130,42 +120,35 @@ def fetch_sp1500_tickers():
     return [t.replace('.', '-') for t in tickers]
 
 def calculate_single_stock_lynch_model(tk):
-    """
-    단일 종목의 Yahoo Finance 재무상태표(BS)를 조회하여
-    피터 린치 오리지널 순현금 공식으로 계산합니다.
-    """
     s = yf.Ticker(tk)
     info = s.info
-    bs = s.balance_sheet
     
+    # 💡 [핵심 필터링 1] 금융 및 리츠 섹터 원천 배제
+    sector = info.get('sector', 'Unknown')
+    if sector in ['Financial Services', 'Real Estate']:
+        return None
+        
+    bs = s.balance_sheet
     price = info.get('currentPrice') or info.get('previousClose')
     shares = info.get('impliedSharesOutstanding') or info.get('sharesOutstanding')
     
-    # 기초 데이터가 없거나 재무제표가 아예 비어있으면 분석 제외
     if not price or not shares or shares == 0 or bs.empty:
         return None
         
     c_name = info.get('shortName', info.get('longName', tk))
-    sector = info.get('sector', 'Unknown')
     
-    # -------------------------------------------------------------------------
-    # 💡 [피터 린치 오리지널 순현금 추출 로직]
-    # 공식: (현금 및 현금성 자산 + 단기 투자자산) - 장기 부채
-    # -------------------------------------------------------------------------
-    
-    # 1. 현금 및 현금성 자산
+    # 1. 현금 및 현금성 자산 + 단기 투자자산
     cash = get_bs_value(bs, ['Cash And Cash Equivalents', 'Cash', 'Cash & Cash Equivalents'])
-    
-    # 2. 단기 투자 자산
     short_inv = get_bs_value(bs, ['Other Short Term Investments', 'Short Term Investments'])
-    
-    # 3. 장기 부채
-    long_debt = get_bs_value(bs, ['Long Term Debt', 'Long-Term Debt', 'Total Long Term Debt'])
-    
     total_cash = cash + short_inv
-    net_cash = total_cash - long_debt
     
-    # 주당 순현금 및 비율 계산
+    # 💡 [핵심 필터링 2] 순수 장기부채 + 1년 내 만기 도래 장기부채(유동부채 편입분) 합산
+    long_debt = get_bs_value(bs, ['Long Term Debt', 'Long-Term Debt', 'Total Long Term Debt'])
+    current_long_debt = get_bs_value(bs, ['Current Debt', 'Current Portion Of Long Term Debt', 'Current Debt And Capital Lease Obligation', 'Short Long Term Debt'])
+    adjusted_long_debt = long_debt + current_long_debt
+    
+    net_cash = total_cash - adjusted_long_debt
+    
     net_cash_per_share = net_cash / shares
     net_cash_ratio = (net_cash_per_share / price) * 100
     
@@ -177,11 +160,10 @@ def calculate_single_stock_lynch_model(tk):
         '주당순현금($)': round(net_cash_per_share, 2),
         '순현금비율(%)': round(net_cash_ratio, 2),
         '총현금(B$)': round(total_cash / 1e9, 2),
-        '장기부채(B$)': round(long_debt / 1e9, 2)
+        '실질장기부채(B$)': round(adjusted_long_debt / 1e9, 2)
     }
 
 def process_market_data():
-    """전체 시장 데이터를 스크래핑하고 최종 데이터프레임을 반환합니다."""
     tickers = fetch_sp1500_tickers()
     if not tickers:
         raise ValueError("티커 목록을 가져오지 못했습니다. 네트워크 상태를 확인하세요.")
@@ -192,7 +174,7 @@ def process_market_data():
     total = len(tickers)
 
     for i, tk in enumerate(tickers, 1):
-        time.sleep(0.05) # 야후 파이낸스 차단 회피를 위한 매너 타임
+        time.sleep(0.05) 
         try:
             raw_data = calculate_single_stock_lynch_model(tk)
             if raw_data:
@@ -213,7 +195,6 @@ def process_market_data():
 
     df = pd.DataFrame(temp_list).replace([np.inf, -np.inf], 0).fillna(0)
     
-    # 순현금비율(%) 기준으로 내림차순 정렬
     df = df.sort_values('순현금비율(%)', ascending=False).reset_index(drop=True)
     df.insert(0, '순위', range(1, len(df) + 1))
     
@@ -222,7 +203,6 @@ def process_market_data():
     
     return df, update_time
 
-
 # =============================================================================
 # 5. 세션 상태 및 라우팅 컨트롤러 (시크릿 URL 로직)
 # =============================================================================
@@ -230,7 +210,6 @@ if 'quant_data' not in st.session_state:
     st.session_state['quant_data'] = None
     st.session_state['last_updated'] = "수집 전"
     
-    # 글로벌 하드디스크(Pickle)에 데이터가 있다면 즉시 메모리로 로드
     global_data = load_global_data()
     if global_data is not None:
         st.session_state['quant_data'] = global_data['df']
@@ -243,9 +222,6 @@ query_params = st.query_params
 if query_params.get("admin") == ADMIN_SECRET_CODE:
     st.session_state['is_admin'] = True
 
-# -----------------------------------------------------------------------------
-# 관리자 권한 데이터 최초 세팅 화면 (엑셀 업로드 UI 완전 제거)
-# -----------------------------------------------------------------------------
 if st.session_state['quant_data'] is None:
     if st.session_state['is_admin']:
         st.title("🛠️ 데이터 수집 센터")
@@ -271,7 +247,6 @@ if st.session_state['quant_data'] is None:
         st.markdown("<br><br><br><div style='text-align: center; color: #888; font-size: 12px;'>powered by TeamChilli</div>", unsafe_allow_html=True)
         st.stop()
 
-
 # =============================================================================
 # 6. 메인 UI 화면 (데이터 로드 완료 상태)
 # =============================================================================
@@ -280,26 +255,22 @@ st.caption(f"최근 데이터 동기화: {st.session_state['last_updated']}")
 
 tab1, tab2, tab3 = st.tabs(["대시보드", "Net Cash TOP 100", "개별 종목 분석"])
 
-# -----------------------------------------------------------------------------
-# 탭 1: 대시보드
-# -----------------------------------------------------------------------------
 with tab1:
     st.subheader("💡 피터 린치의 오리지널 순현금 모델")
     st.markdown('''
     "어떤 회사의 주당 순현금이 3달러이고 주가가 10달러라면, 당신은 이 주식을 10달러가 아니라 **실질적으로 7달러**에 사는 것이다." 
     - *피터 린치 (Peter Lynch)*
     
-    * **순현금 공식:** (현금 및 현금성 자산 + 단기 투자자산) - (장기 부채)
+    * **순현금 공식:** (현금 및 단기투자자산) - (장기 부채 + 1년 내 만기도래 장기부채)
     * **주당 순현금:** 순현금 / 총 발행 주식 수
     * **순현금비율(%):** (주당 순현금 / 현재 주가) × 100
     
-    단기적인 외상값(유동부채)은 고려하지 않고, 회사 금고에 당장 현금화할 수 있는 자산에서 
-    장기적으로 갚아야 할 은행 빚을 모두 털어낸 **오리지널 피터 린치 공식**을 사용합니다.
-    비율이 높을수록 기업이 보유한 현금이 주가를 강력하게 지지하고 있다는 뜻입니다.
+    영업을 위한 단기적인 외상값은 고려하지 않고, 회사 금고에 당장 현금화할 수 있는 자산에서 
+    은행에 갚아야 할 실질적인 이자 발생 부채를 모두 털어낸 **오리지널 피터 린치 공식**을 사용합니다.
+    (회계 구조가 다른 금융 및 리츠 섹터 종목은 랭킹에서 원천 제외됩니다.)
     ''')
     st.divider()
     
-    # 엑셀 업로드는 제거하고, API 강제 재수집 패널만 남김
     if st.session_state['is_admin']:
         st.markdown("### 🛠️ [관리자 전용] 데이터 갱신 패널")
         col1, col2 = st.columns(2)
@@ -327,14 +298,11 @@ with tab1:
                     use_container_width=True
                 )
 
-# -----------------------------------------------------------------------------
-# 탭 2: Net Cash TOP 100 
-# -----------------------------------------------------------------------------
 with tab2:
     st.subheader("🏆 순현금비율(%) TOP 100 (S&P 1500)")
     if st.session_state['quant_data'] is not None:
         df = st.session_state['quant_data'].copy()
-        df = df[df['순현금비율(%)'] > 0] # 순현금이 플러스인 기업만 노출
+        df = df[df['순현금비율(%)'] > 0] 
         
         st.dataframe(
             df.head(100),
@@ -353,13 +321,10 @@ with tab2:
                     max_value=100
                 ),
                 "총현금(B$)": st.column_config.NumberColumn(format="%.2f B"),
-                "장기부채(B$)": st.column_config.NumberColumn(format="%.2f B")
+                "실질장기부채(B$)": st.column_config.NumberColumn(format="%.2f B")
             }
         )
 
-# -----------------------------------------------------------------------------
-# 탭 3: 개별 종목 딥다이브
-# -----------------------------------------------------------------------------
 with tab3:
     st.subheader("🔍 개별 종목 실시간 분석")
     with st.form("search_form"):
@@ -370,7 +335,6 @@ with tab3:
         tk = ticker_input.upper().strip()
         df = st.session_state['quant_data']
         
-        # 1차 시도: 이미 긁어놓은 DB 내부 조회
         if df is not None and tk in df['종목'].values:
             with st.spinner("DB 로드 중..."):
                 row = df[df['종목'] == tk].iloc[0]
@@ -381,11 +345,11 @@ with tab3:
                 
                 if ratio > 50: summ = "엄청난 수준의 현금을 보유하고 있습니다. 회사 금고의 현금이 주가의 절반 이상을 보증합니다!"
                 elif ratio > 20: summ = "매우 건전한 상태입니다. 든든한 순현금이 하락장을 방어해 줄 것입니다."
-                elif ratio > 0: summ = "장기 부채보다 현금이 더 많아 재무적으로 안정적입니다."
-                else: summ = "현재 보유한 현금보다 갚아야 할 장기 부채가 더 많아 주당 순현금이 마이너스(-) 상태입니다."
+                elif ratio > 0: summ = "실질 장기부채보다 현금이 더 많아 재무적으로 안정적입니다."
+                else: summ = "현재 보유한 현금보다 갚아야 할 실질 장기부채가 더 많아 주당 순현금이 마이너스(-) 상태입니다."
 
                 st.success(f"### {row['기업명']} ({tk}) : 순현금비율 {ratio}%")
-                st.caption(f"섹터: {row['섹터']} | 랭킹: S&P 전체 {row['순위']}위")
+                st.caption(f"섹터: {row['섹터']} | 랭킹: 비금융 전체 {row['순위']}위")
                 st.info(f"💡 총평: {summ}")
                 
                 col1, col2, col3 = st.columns(3)
@@ -395,16 +359,15 @@ with tab3:
                 
                 col4, col5 = st.columns(2)
                 col4.metric("총 현금 (Total Cash)", f"${row['총현금(B$)']} Billion")
-                col5.metric("장기 부채 (Long Term Debt)", f"${row['장기부채(B$)']} Billion")
+                col5.metric("조정 장기부채 (Long Term + Current Portion)", f"${row['실질장기부채(B$)']} Billion")
                 
-        # 2차 시도: S&P 1500 목록에 없거나 DB에 없을 경우 야후 API 직접 찌르기
         else:
             st.warning(f"'{tk}'는 현재 DB에 없어 야후 파이낸스에서 실시간으로 재무제표를 조회합니다.")
             with st.spinner("야후 서버에서 정보 추출 중..."):
                 try:
                     raw = calculate_single_stock_lynch_model(tk)
                     if not raw:
-                        st.error("데이터 부족 또는 상장폐지/재무 미제공 종목입니다.")
+                        st.error("데이터 부족, 상장폐지, 또는 순현금 분석에서 제외되는 금융/리츠 섹터입니다.")
                     else:
                         price = raw['현재주가($)']
                         net_cash_per_share = raw['주당순현금($)']
@@ -412,8 +375,8 @@ with tab3:
                         
                         if ratio > 50: summ = "엄청난 수준의 현금을 보유하고 있습니다. 회사 금고의 현금이 주가의 절반 이상을 보증합니다!"
                         elif ratio > 20: summ = "매우 건전한 상태입니다. 든든한 순현금이 하락장을 방어해 줄 것입니다."
-                        elif ratio > 0: summ = "장기 부채보다 현금이 더 많아 재무적으로 안정적입니다."
-                        else: summ = "현재 보유한 현금보다 갚아야 할 장기 부채가 더 많아 주당 순현금이 마이너스(-) 상태입니다."
+                        elif ratio > 0: summ = "실질 장기부채보다 현금이 더 많아 재무적으로 안정적입니다."
+                        else: summ = "현재 보유한 현금보다 갚아야 할 실질 장기부채가 더 많아 주당 순현금이 마이너스(-) 상태입니다."
 
                         st.success(f"### {raw['기업명']} ({tk}) : 순현금비율 {ratio}%")
                         st.caption(f"섹터: {raw['섹터']} | (실시간 산출 데이터)")
@@ -426,11 +389,10 @@ with tab3:
                         
                         col4, col5 = st.columns(2)
                         col4.metric("총 현금 (Total Cash)", f"${raw['총현금(B$)']} Billion")
-                        col5.metric("장기 부채 (Long Term Debt)", f"${raw['장기부채(B$)']} Billion")
+                        col5.metric("조정 장기부채 (Long Term + Current Portion)", f"${raw['실질장기부채(B$)']} Billion")
                         
                 except Exception as e:
                     logger.error(f"Live fetch error for {tk}: {e}")
                     st.error("야후 서버 통신에 실패했습니다. 잠시 후 다시 시도해 주세요.")
 
-# 푸터
 st.markdown("<br><br><br><div style='text-align: center; color: #888; font-size: 12px;'>powered by TeamChilli</div>", unsafe_allow_html=True)
