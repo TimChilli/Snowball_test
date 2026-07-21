@@ -2,13 +2,12 @@
 ===============================================================================
 Project: SnowBall Quant Terminal (Web Edition)
 Author: TeamChilli
-Version: 10.5 (Precision Net Cash & Complete Features)
+Version: 11.0 (US Full Market 6000+ Web Scanner Integrated)
 Description: 
-    - 최신 분기 재무제표(Quarterly Balance Sheet) 1순위 조회
-    - YELP 등 특수 부채 항목(Long Term Debt Non Current 등) 핀셋 추출
-    - 금융/리츠 섹터 원천 제외
-    - EPS > 0 흑자 기업 기반 섹터 평균 PER 계산
-    - 천 단위 콤마(,) 렌더링 및 UI 규격 최적화
+    - S&P 1500 실시간 스캔 외에 미국 전체 주식(약 6,000개) 스캔 기능 웹 통합
+    - 나스닥 공식 서버 FTP 통신 및 SEC 백업 통신 연동
+    - 중간 튕김 방지 및 차단 시 부분 데이터 강제 보존(비상 세이브) 기능 탑재
+    - 피터 린치 오리지널 순현금 모델 적용 및 UI 최적화 유지
 ===============================================================================
 """
 
@@ -88,10 +87,9 @@ def get_trade_day():
     return now.strftime('%Y-%m-%d')
 
 def get_bs_value(bs, possible_keys):
-    """지정된 복수의 키값을 최신 분기 재무제표 인덱스에서 조회"""
     if bs is None or bs.empty: 
         return 0.0
-    recent_bs = bs.iloc[:, 0] # 가장 최근 분기
+    recent_bs = bs.iloc[:, 0]
     for key in possible_keys:
         if key in recent_bs.index:
             val = recent_bs[key]
@@ -100,10 +98,11 @@ def get_bs_value(bs, possible_keys):
     return 0.0
 
 # =============================================================================
-# 4. 피터 린치 코어 엔진
+# 4. 티커 수집 모듈 (S&P 1500 vs US Full Market)
 # =============================================================================
 def fetch_sp1500_tickers():
-    logger.info("Fetching S&P 1500 tickers from Wikipedia...")
+    """위키피디아 S&P 1500 수집 (대형/중형/소형)"""
+    logger.info("Fetching S&P 1500 tickers...")
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
     
@@ -112,8 +111,7 @@ def fetch_sp1500_tickers():
             res = requests.get(url, headers=session.headers)
             df = pd.read_html(io.StringIO(res.text))[0]
             return df['Symbol' if 'Symbol' in df.columns else 'Ticker symbol'].tolist()
-        except Exception as e:
-            logger.error(f"Ticker fetching error for URL {url}: {e}")
+        except Exception:
             return []
     
     sp500 = get_t('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
@@ -123,21 +121,44 @@ def fetch_sp1500_tickers():
     tickers = list(set(sp500 + sp400 + sp600))
     return [t.replace('.', '-') for t in tickers]
 
+def get_us_full_tickers():
+    """미국 증시 전 종목 티커 수집 (나스닥 FTP 및 SEC 백업)"""
+    logger.info("Fetching US Full Market tickers...")
+    url = "ftp://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqtraded.txt"
+    try:
+        df = pd.read_csv(url, sep="|")
+        df = df[(df['Test Issue'] == 'N') & (df['ETF'] == 'N')]
+        tickers = df['NASDAQ Symbol'].dropna().tolist()
+        tickers = [str(t).strip().replace('.', '-') for t in tickers if isinstance(t, str)]
+        return tickers
+    except Exception as e:
+        logger.warning(f"FTP failed ({e}), trying SEC fallback...")
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            res = requests.get('https://www.sec.gov/files/company_tickers.json', headers=headers)
+            data = res.json()
+            tickers = [item['ticker'].replace('.', '-') for item in data.values()]
+            return list(set(tickers))
+        except Exception as e2:
+            logger.error(f"Both ticker sources failed: {e2}")
+            return []
+
+# =============================================================================
+# 5. 피터 린치 코어 분석 엔진
+# =============================================================================
 def calculate_single_stock_lynch_model(tk):
     s = yf.Ticker(tk)
     info = s.info
     
-    # 1. 금융/리츠 섹터 제외
     sector = info.get('sector', 'Unknown')
     if sector in ['Financial Services', 'Real Estate']:
         return None
         
-    # 2. 최신 분기(Quarterly) 재무제표 1순위 조회 (없으면 연간)
     bs = s.quarterly_balance_sheet
     if bs is None or bs.empty:
         bs = s.balance_sheet
         
-    inc = s.financials # 연간 순이익 트렌드용
+    inc = s.financials
     
     price = info.get('currentPrice') or info.get('previousClose')
     shares = info.get('impliedSharesOutstanding') or info.get('sharesOutstanding')
@@ -148,7 +169,6 @@ def calculate_single_stock_lynch_model(tk):
         
     c_name = info.get('shortName', info.get('longName', tk))
     
-    # 3. 현금 및 장기부채 정밀 추출 (YELP 변형 키값 완전 포함)
     cash_keys = [
         'Cash Cash Equivalents And Short Term Investments',
         'Cash And Cash Equivalents',
@@ -170,7 +190,6 @@ def calculate_single_stock_lynch_model(tk):
     total_cash = get_bs_value(bs, cash_keys)
     adjusted_long_debt = get_bs_value(bs, long_debt_keys)
     
-    # 만약 재무상태표 개별 항목이 안 잡힐 경우 info의 기본값 안전장치
     if total_cash == 0:
         total_cash = float(info.get('totalCash') or 0.0)
         
@@ -178,7 +197,6 @@ def calculate_single_stock_lynch_model(tk):
     net_cash_per_share = net_cash / shares
     net_cash_ratio = (net_cash_per_share / price) * 100
     
-    # 4. 연간 순이익 연속 성장(▲) 체크
     consecutive_growth = 0
     if inc is not None and not inc.empty:
         for key in ['Net Income', 'Net Income Common Stockholders']:
@@ -194,7 +212,6 @@ def calculate_single_stock_lynch_model(tk):
                 break
     growth_str = '▲' * consecutive_growth if consecutive_growth > 0 else '-'
 
-    # 5. PER 3종 세트
     trailing_pe = info.get('trailingPE', 0)
     forward_pe = info.get('forwardPE', 0)
     eps = info.get('trailingEps', 0)
@@ -220,8 +237,15 @@ def calculate_single_stock_lynch_model(tk):
         '순현금_PER': round(net_cash_per, 2)
     }
 
-def process_market_data():
-    tickers = fetch_sp1500_tickers()
+def process_market_data(mode="sp1500"):
+    """
+    mode: 'sp1500' 또는 'full'
+    """
+    if mode == "full":
+        tickers = get_us_full_tickers()
+    else:
+        tickers = fetch_sp1500_tickers()
+        
     if not tickers:
         raise ValueError("티커 목록을 가져오지 못했습니다. 네트워크 상태를 확인하세요.")
 
@@ -229,30 +253,39 @@ def process_market_data():
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(tickers)
+    
+    error_streak = 0 # 연속 에러 카운터 (야후 밴 방어용)
 
     for i, tk in enumerate(tickers, 1):
-        time.sleep(0.05) 
+        time.sleep(0.05) # 차단 회피 매너 타임
         try:
             raw_data = calculate_single_stock_lynch_model(tk)
             if raw_data:
                 temp_list.append(raw_data)
+                error_streak = 0
         except Exception as e:
             logger.warning(f"Error fetching {tk}: {e}")
+            error_streak += 1
             pass
-        
+            
+        # UI 부하를 줄이기 위해 간헐적 업데이트
         if i % 10 == 0 or i == total:
             progress_bar.progress(i / total)
-            status_text.text(f"API 통신: 최신 분기 순현금 분석 중... ({i}/{total})")
+            status_text.text(f"API 통신 중... ({i}/{total}) | 현재 확보: {len(temp_list)}종목")
+            
+        # 야후 서버에서 연속으로 100번 이상 차단당하면 즉시 루프 중단 (Graceful Stop)
+        if error_streak > 100:
+            status_text.text(f"🚨 야후 파이낸스 접속 차단 감지! 현재까지 수집된 {len(temp_list)}개 종목으로 비상 저장합니다.")
+            break
 
     progress_bar.empty()
     status_text.empty()
 
     if len(temp_list) == 0:
-        raise ValueError("야후 파이낸스 서버가 접근을 차단하여 데이터를 가져오지 못했습니다.")
+        raise ValueError("야후 파이낸스 서버가 접근을 전면 차단하여 데이터를 가져오지 못했습니다.")
 
     df = pd.DataFrame(temp_list).replace([np.inf, -np.inf], 0).fillna(0)
     
-    # EPS > 0 (흑자) 기업만 선별하여 섹터 평균 PER 계산
     valid_per_df = df[df['PER'] > 0]
     sector_per_map = valid_per_df.groupby('섹터')['PER'].mean().round(1).to_dict()
     df['섹터평균_PER'] = df['섹터'].map(sector_per_map).fillna(0.0)
@@ -266,7 +299,7 @@ def process_market_data():
     return df, sector_per_map, update_time
 
 # =============================================================================
-# 5. 세션 상태 및 라우팅 컨트롤러
+# 6. 세션 상태 및 라우팅 컨트롤러
 # =============================================================================
 if 'quant_data' not in st.session_state: 
     st.session_state['quant_data'] = None
@@ -289,15 +322,16 @@ if query_params.get("admin") == ADMIN_SECRET_CODE:
 if st.session_state['quant_data'] is None:
     if st.session_state['is_admin']:
         st.title("🛠️ 데이터 수집 센터")
-        st.info("현재 서버에 랭킹 데이터가 없습니다. 원하시는 방식으로 데이터를 세팅하세요.")
+        st.info("현재 서버에 랭킹 데이터가 없습니다. 원하시는 스캐닝 방식을 선택하세요.")
 
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("1️⃣ S&P 1500 실시간 수집 (API)")
-            if st.button("🚀 실시간 스크래핑 시작", use_container_width=True):
-                with st.spinner("야후 파이낸스 최신 분기 재무제표 분석 중... (약 10~15분)"):
+            st.subheader("1️⃣ S&P 1500 안전 스캐닝")
+            st.caption("소요시간 약 10~15분. IP 차단 확률 낮음.")
+            if st.button("🚀 S&P 1500 실시간 스크래핑", use_container_width=True):
+                with st.spinner("야후 파이낸스에서 안전하게 수집 중..."):
                     try:
-                        df, sector_map, updated_time = process_market_data()
+                        df, sector_map, updated_time = process_market_data(mode="sp1500")
                         save_global_data(df, sector_map, updated_time)
                         st.session_state['quant_data'] = df
                         st.session_state['sector_per_map'] = sector_map
@@ -307,30 +341,21 @@ if st.session_state['quant_data'] is None:
                         st.error(f"에러 발생: {e}")
                         
         with col2:
-            st.subheader("2️⃣ 로컬 전수 조사 CSV 업로드 (미국 전체 6,000개)")
-            st.caption("로컬 스캔 스크립트(scan_us_market.py)로 생성한 파일 업로드")
-            uploaded_file = st.file_uploader("전수조사 CSV/엑셀 업로드", type=["csv", "xlsx"], label_visibility="collapsed")
-            if uploaded_file is not None:
-                try:
-                    df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
-                    
-                    # 업로드된 파일 기반 섹터 평균 PER 재계산
-                    if 'PER' in df.columns and '섹터' in df.columns:
-                        valid_df = df[df['PER'] > 0]
-                        sector_map = valid_df.groupby('섹터')['PER'].mean().round(1).to_dict()
-                        df['섹터평균_PER'] = df['섹터'].map(sector_map).fillna(0.0)
-                    else:
-                        sector_map = {}
-                        
-                    save_global_data(df, sector_map, "로컬 전수 조사 동기화 완료")
-                    st.session_state['quant_data'] = df
-                    st.session_state['sector_per_map'] = sector_map
-                    st.session_state['last_updated'] = "미국 전체 전수 조사 반영 완료"
-                    st.success("적용 완료! 글로벌 사용자에게 반영되었습니다.")
-                    time.sleep(1)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"업로드 에러: {e}")
+            st.subheader("2️⃣ 미국 전체(6,000+) 하드코어 스캐닝")
+            st.caption("⚠️ 소요시간 1~2시간. 클라우드 환경 시 타임아웃/IP 밴 위험.")
+            if st.button("🔥 미국 전 종목 6000+ 스크래핑", type="primary", use_container_width=True):
+                with st.spinner("미국 전체 주식 전수 조사 중! 화면을 끄지 마세요..."):
+                    try:
+                        df, sector_map, updated_time = process_market_data(mode="full")
+                        save_global_data(df, sector_map, f"{updated_time} (전수조사)")
+                        st.session_state['quant_data'] = df
+                        st.session_state['sector_per_map'] = sector_map
+                        st.session_state['last_updated'] = f"{updated_time} (전수조사)"
+                        st.success("미국 전 증시 스캐닝 완료!")
+                        time.sleep(2)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"전수조사 에러: {e}")
         
         st.markdown("<br><br><br><div style='text-align: center; color: #888; font-size: 12px;'>powered by TeamChilli</div>", unsafe_allow_html=True)
         st.stop()
@@ -342,12 +367,12 @@ if st.session_state['quant_data'] is None:
         st.stop()
 
 # =============================================================================
-# 6. 메인 UI 화면 
+# 7. 메인 UI 화면 
 # =============================================================================
 st.title("💰 피터 린치 주당 순현금 랭킹")
 st.caption(f"최근 데이터 동기화: {st.session_state['last_updated']}")
 
-tab1, tab2, tab3 = st.tabs(["대시보드", "Net Cash TOP 100", "개별 종목 분석"])
+tab1, tab2, tab3 = st.tabs(["대시보드", "Net Cash 랭킹 보드", "개별 종목 딥다이브"])
 
 with tab1:
     st.subheader("💡 피터 린치의 오리지널 순현금 모델")
@@ -368,37 +393,46 @@ with tab1:
         st.markdown("### 🛠️ [관리자 전용] 데이터 갱신 패널")
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("야후 API 전체 강제 재수집", use_container_width=True):
-                with st.spinner("야후 서버에서 전체 데이터를 다시 긁어오는 중..."):
+            st.markdown("##### 🚀 S&P 1500 안전 스캐닝")
+            if st.button("야후 API 1,500종목 강제 재수집", use_container_width=True):
+                with st.spinner("야후 서버에서 S&P 1500 데이터를 다시 긁어오는 중..."):
                     try:
-                        df, sector_map, updated_time = process_market_data()
+                        df, sector_map, updated_time = process_market_data(mode="sp1500")
                         save_global_data(df, sector_map, updated_time)
                         st.session_state['quant_data'] = df
                         st.session_state['sector_per_map'] = sector_map
                         st.session_state['last_updated'] = updated_time
-                        st.success("글로벌 데이터가 갱신되었습니다.")
+                        st.success("데이터가 갱신되었습니다.")
                         time.sleep(1)
                         st.rerun()
                     except Exception as e:
                         st.error(f"통신 실패: {e}")
         with col2:
-            uploaded_file = st.file_uploader("전수조사 CSV/엑셀 수동 동기화", type=["csv", "xlsx"])
-            if uploaded_file is not None:
-                try:
-                    df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
-                    valid_df = df[df['PER'] > 0] if 'PER' in df.columns else df
-                    sector_map = valid_df.groupby('섹터')['PER'].mean().round(1).to_dict() if '섹터' in df.columns else {}
-                    if '섹터' in df.columns:
-                        df['섹터평균_PER'] = df['섹터'].map(sector_map).fillna(0.0)
-                    save_global_data(df, sector_map, "수동 파일 동기화 완료")
-                    st.session_state['quant_data'] = df
-                    st.session_state['sector_per_map'] = sector_map
-                    st.session_state['last_updated'] = "수동 파일 동기화 완료"
-                    st.success("데이터 로드 성공!")
-                    time.sleep(1)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"업로드 에러: {e}")
+            st.markdown("##### 🔥 미국 전체(6,000+) 스캐닝")
+            if st.button("미국 전 종목 6000+ 스크래핑", type="primary", use_container_width=True):
+                with st.spinner("미국 전체 주식 전수 조사 중! 화면을 끄지 마세요..."):
+                    try:
+                        df, sector_map, updated_time = process_market_data(mode="full")
+                        save_global_data(df, sector_map, f"{updated_time} (전수조사)")
+                        st.session_state['quant_data'] = df
+                        st.session_state['sector_per_map'] = sector_map
+                        st.session_state['last_updated'] = f"{updated_time} (전수조사)"
+                        st.success("전수조사 완료!")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"통신 실패: {e}")
+        
+        st.markdown("---")
+        if st.session_state['quant_data'] is not None:
+            csv_data = st.session_state['quant_data'].to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="📥 현재 DB 로컬 다운로드 (CSV 백업용)", 
+                data=csv_data, 
+                file_name=f"PeterLynch_NetCash_{datetime.datetime.now().strftime('%Y%m%d')}.csv", 
+                mime="text/csv", 
+                use_container_width=True
+            )
 
 with tab2:
     st.subheader("🏆 순현금비율(%) TOP 100")
@@ -412,7 +446,6 @@ with tab2:
             '현재주가($)', '주당순현금($)', '총현금(M$)', '실질장기부채(M$)'
         ]
         
-        # 없는 칼럼 자동 보완 처리
         for c in display_cols:
             if c not in df.columns: df[c] = 0.0
         
@@ -430,7 +463,7 @@ with tab2:
                 "PER": st.column_config.NumberColumn(format="%,.1f"),
                 "Fwd_PER": st.column_config.NumberColumn(format="%,.1f"),
                 "순현금_PER": st.column_config.NumberColumn(format="%,.1f", help="(현재 주가 - 주당 순현금) / EPS"),
-                "섹터평균_PER": st.column_config.NumberColumn(format="%,.1f", help="해당 섹터 내 흑자(EPS>0) 기업의 평균 PER"),
+                "섹터평균_PER": st.column_config.NumberColumn(format="%,.1f", help="해당 섹터 내 흑자 기업의 평균 PER"),
                 "순이익성장": st.column_config.TextColumn(width=80, help="연간 순이익 연속 상승 횟수 (▲)"),
                 "현재주가($)": st.column_config.NumberColumn(format="$%,.2f"),
                 "주당순현금($)": st.column_config.NumberColumn(format="$%,.2f"),
