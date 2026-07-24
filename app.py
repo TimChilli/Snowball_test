@@ -2,12 +2,11 @@
 ===============================================================================
 Project: SnowBall Quant Terminal (Web Edition)
 Author: TeamChilli
-Version: 11.8 (Smart Partition UI & Ticker Caching)
+Version: 11.9 (Ultimate ADR/ADS Eradication & Country Blacklist)
 Description: 
-    - 6000+ 전수 스캐닝 시, 투명한 500개 단위 '그룹 선택형 UI(Chunk Selection)' 도입
-    - 드롭다운에 각 그룹별 [수집완료: X/500] 진척도 실시간 직관적 표기
-    - 나스닥/S&P 티커 리스트 @st.cache_data 적용으로 UI 버벅임 완벽 해소
-    - 빈 곳만 핀포인트로 메꿔넣는 Zero-Loss 병합 엔진 유지
+    - 야후 파이낸스에서 이름을 위장한 중국계 ADS(BILI, ATAT 등)를 잡아내기 위한 국적(Country) 블랙리스트 추가
+    - 'QUADRANT' 등 정상 단어의 오탐지를 막기 위해 Regex(정규식) 기반 Word Boundary 필터링 적용
+    - 재무제표 통화(Currency) 환산 오류로 인한 5000%+ 기형 데이터 원천 차단
 ===============================================================================
 """
 
@@ -23,6 +22,7 @@ import pytz
 import os
 import pickle
 import logging
+import re
 
 # =============================================================================
 # 1. 시스템 설정 및 로깅 초기화
@@ -87,7 +87,7 @@ def get_bs_value(bs, possible_keys):
     return 0.0
 
 # =============================================================================
-# 4. 티커 수집 모듈 (빠른 UI를 위한 캐싱 적용)
+# 4. 티커 수집 모듈 (캐싱 적용)
 # =============================================================================
 @st.cache_data(ttl=86400)
 def get_cached_sp1500_tickers():
@@ -130,14 +130,25 @@ def calculate_single_stock_lynch_model(tk):
     s = yf.Ticker(tk)
     info = s.info
     
+    # 💡 [필터링 1] 섹터 제외
     sector = info.get('sector', 'Unknown')
     if sector in ['Financial Services', 'Real Estate']: return None
     
+    # 💡 [필터링 2] 국적(Country) 기반 야후 환율 오류/ADR 원천 차단
+    country = info.get('country', 'Unknown').upper()
+    blocked_countries = ['CHINA', 'HONG KONG', 'TAIWAN', 'MACAU', 'RUSSIA', 'BRAZIL', 'INDIA', 'ARGENTINA', 'MEXICO', 'SOUTH KOREA', 'SOUTH AFRICA']
+    if country in blocked_countries:
+        return None
+    
+    # 💡 [필터링 3] 정규식(Regex)을 이용한 오탐 없는 ADR/ADS 정밀 필터링
     short_name = info.get('shortName', '').upper()
     long_name = info.get('longName', '').upper()
     quote_type = info.get('quoteType', '')
-    adr_keywords = ['ADR', 'ADS', 'DEPOSITARY', 'DEPOSITORY']
-    if quote_type == 'ADR' or any(kw in short_name for kw in adr_keywords) or any(kw in long_name for kw in adr_keywords):
+    
+    if quote_type == 'ADR': return None
+    name_str = f"{short_name} {long_name}"
+    # 단어 경계(\b)를 사용하여 독립된 단어일 때만 차단 (예: QUADRANT 통과, BILI ADS 차단)
+    if re.search(r'\b(ADR|ADS|DEPOSITARY|DEPOSITORY|RECEIPT)\b', name_str):
         return None
         
     bs = s.quarterly_balance_sheet
@@ -161,7 +172,9 @@ def calculate_single_stock_lynch_model(tk):
     net_cash = total_cash - adjusted_long_debt
     net_cash_per_share = net_cash / shares
     net_cash_ratio = (net_cash_per_share / price) * 100
-    if net_cash_ratio > 500: return None
+    
+    # 💡 [필터링 4] 비정상 환율/데이터 단위 꼬임으로 인한 극단적 오류값 차단
+    if net_cash_ratio > 400: return None
     
     consecutive_growth = 0
     if inc is not None and not inc.empty:
@@ -190,7 +203,6 @@ def calculate_single_stock_lynch_model(tk):
     }
 
 def process_market_data(target_tickers, expected_time="10~15분"):
-    """💡 [핵심] 전달받은 특정 그룹(Chunk)의 티커만 안전하게 스캔하여 병합합니다."""
     existing_df = st.session_state.get('quant_data')
     processed_tickers = set()
     
@@ -198,7 +210,6 @@ def process_market_data(target_tickers, expected_time="10~15분"):
         if '종목' in existing_df.columns:
             processed_tickers = set(existing_df['종목'].dropna().tolist())
     
-    # DB에 이미 있는 종목은 제외 (순수 누락분만 수집)
     tickers_to_process = [tk for tk in target_tickers if tk not in processed_tickers]
     total = len(tickers_to_process)
     
@@ -244,7 +255,6 @@ def process_market_data(target_tickers, expected_time="10~15분"):
 
     new_df = pd.DataFrame(temp_list)
     
-    # 병합 및 중복 제거
     if existing_df is not None and not existing_df.empty:
         if not new_df.empty:
             if '순위' in existing_df.columns: existing_df = existing_df.drop(columns=['순위'])
@@ -258,7 +268,6 @@ def process_market_data(target_tickers, expected_time="10~15분"):
     if combined_df.empty:
         raise ValueError("수집된 데이터가 없습니다. 야후 서버 차단을 의심해보세요.")
 
-    # 섹터 평균 업데이트
     if 'PER' in combined_df.columns and '섹터' in combined_df.columns:
         valid_per_df = combined_df[combined_df['PER'] > 0]
         sector_per_map = valid_per_df.groupby('섹터')['PER'].mean().round(1).to_dict()
@@ -318,11 +327,12 @@ if 'is_admin' not in st.session_state: st.session_state['is_admin'] = False
 if st.query_params.get("admin") == ADMIN_SECRET_CODE: st.session_state['is_admin'] = True
 
 def render_admin_panel():
-    """관리자용 수집 UI (초기 화면 및 메인 화면 공통 사용)"""
     if st.session_state['scan_msg']:
-        if "완료" in st.session_state['scan_msg']: st.success(st.session_state['scan_msg'])
-        else: st.error(st.session_state['scan_msg'])
-        
+        if "완료" in st.session_state['scan_msg'] or "성공" in st.session_state['scan_msg']: 
+            st.success(st.session_state['scan_msg'])
+        else: 
+            st.error(st.session_state['scan_msg'])
+            
     col1, col2 = st.columns([1, 1.2])
     
     db_tickers = set()
@@ -360,7 +370,6 @@ def render_admin_panel():
             chunk_slice = us_tks[start_idx:end_idx]
             done_cnt = len([t for t in chunk_slice if t in db_tickers])
             
-            # 드롭다운 라벨 생성
             label = f"그룹 {i+1} ({start_idx+1} ~ {end_idx}) - [수집완료: {done_cnt} / {len(chunk_slice)}]"
             chunk_options[label] = chunk_slice
             
@@ -406,7 +415,7 @@ def render_admin_panel():
             st.rerun()
 
 # =============================================================================
-# 7. 메인 라우팅 (DB 비어있을 때 vs 찼을 때)
+# 7. 메인 라우팅
 # =============================================================================
 if st.session_state['quant_data'] is None:
     if st.session_state['is_admin']:
@@ -428,6 +437,18 @@ st.caption(f"최근 데이터 동기화: {st.session_state['last_updated']}")
 tab1, tab2, tab3 = st.tabs(["대시보드", "Net Cash 랭킹 보드", "개별 종목 딥다이브"])
 
 with tab1:
+    st.markdown("### 📰 간밤의 미국 증시 헤드라인 (SPY)")
+    news_list = fetch_overnight_news()
+    if news_list:
+        for item in news_list:
+            title = item.get('title', 'No Title')
+            link = item.get('link', '#')
+            publisher = item.get('publisher', 'Unknown')
+            st.markdown(f"- [{title}]({link}) *(출처: {publisher})*")
+    else:
+        st.info("현재 불러올 수 있는 최신 뉴스가 없습니다.")
+    st.divider()
+
     st.subheader("💡 피터 린치의 오리지널 순현금 모델")
     st.markdown('''
     "어떤 회사의 주당 순현금이 3달러이고 주가가 10달러라면, 당신은 이 주식을 10달러가 아니라 **실질적으로 7달러**에 사는 것이다." 
