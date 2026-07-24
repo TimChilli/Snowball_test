@@ -2,12 +2,10 @@
 ===============================================================================
 Project: SnowBall Quant Terminal (Web Edition)
 Author: TeamChilli
-Version: 11.4 (Step-by-Step Expansion & Zero Data Loss Architecture)
+Version: 11.5 (Advanced ADS/ADR Filter Patch)
 Description: 
-    - S&P 1500 -> 미국 전체(6000+)로 이어지는 단계별 데이터 누적(Expand) 시스템
-    - 새로 수집/이어서 수집 버튼 통합 (자동 부족분 스캔)
-    - 기존 데이터 보존을 위한 병합(Concat) 최적화 및 중복 방지
-    - 완전 초기화를 위한 리셋(Reset) 버튼 분리
+    - BILI, ATAT 등 ADS(American Depositary Shares) 종목 완벽 차단
+    - 'ADR', 'ADS', 'DEPOSITARY', 'DEPOSITORY' 키워드 전면 필터링
 ===============================================================================
 """
 
@@ -76,7 +74,6 @@ def load_global_data():
     return None
 
 def clear_global_data():
-    """DB를 완전히 삭제하고 초기화합니다."""
     if os.path.exists(SHARED_FILE):
         os.remove(SHARED_FILE)
 
@@ -131,9 +128,18 @@ def calculate_single_stock_lynch_model(tk):
     s = yf.Ticker(tk)
     info = s.info
     
+    # 💡 [필터링 1] 금융/리츠 제외
     sector = info.get('sector', 'Unknown')
     if sector in ['Financial Services', 'Real Estate']: return None
-    if info.get('quoteType') == 'ADR' or 'ADR' in info.get('shortName', '').upper(): return None
+    
+    # 💡 [필터링 2] ADR 및 ADS (BILI, ATAT 등) 완벽 차단망
+    short_name = info.get('shortName', '').upper()
+    long_name = info.get('longName', '').upper()
+    quote_type = info.get('quoteType', '')
+    
+    adr_keywords = ['ADR', 'ADS', 'DEPOSITARY', 'DEPOSITORY']
+    if quote_type == 'ADR' or any(kw in short_name for kw in adr_keywords) or any(kw in long_name for kw in adr_keywords):
+        return None
         
     bs = s.quarterly_balance_sheet
     if bs is None or bs.empty: bs = s.balance_sheet
@@ -143,6 +149,7 @@ def calculate_single_stock_lynch_model(tk):
     shares = info.get('impliedSharesOutstanding') or info.get('sharesOutstanding')
     market_cap = info.get('marketCap', 0)
     
+    # 💡 [필터링 3] 페니스탁 및 데이터 찌꺼기 차단
     if not price or not shares or shares == 0 or bs is None or bs.empty: return None
     if price < 1.0 or market_cap < 50000000: return None
         
@@ -157,7 +164,8 @@ def calculate_single_stock_lynch_model(tk):
     net_cash_per_share = net_cash / shares
     net_cash_ratio = (net_cash_per_share / price) * 100
     
-    if net_cash_ratio > 300: return None
+    # 💡 [필터링 4] 비정상 비율 차단 (500% 초과는 회계 에러로 간주)
+    if net_cash_ratio > 500: return None
     
     consecutive_growth = 0
     if inc is not None and not inc.empty:
@@ -186,9 +194,6 @@ def calculate_single_stock_lynch_model(tk):
     }
 
 def process_market_data(mode="sp1500"):
-    """💡 [핵심] 기존 데이터를 절대 버리지 않고, 누락된 종목만 찾아내어 덧붙이는 스마트 누적 로직"""
-    
-    # 1. 타겟 유니버스 선정
     if mode == "full":
         target_tickers = get_us_full_tickers()
         expected_time = "1~2시간"
@@ -198,7 +203,6 @@ def process_market_data(mode="sp1500"):
         
     if not target_tickers: raise ValueError("티커 목록을 가져오지 못했습니다.")
 
-    # 2. 기존 DB 로드 및 중복 필터링
     existing_df = st.session_state.get('quant_data')
     processed_tickers = set()
     
@@ -212,7 +216,6 @@ def process_market_data(mode="sp1500"):
     if total == 0:
         return existing_df, st.session_state.get('sector_per_map', {}), st.session_state.get('last_updated', ''), "✅ 해당 단계에 필요한 모든 종목이 이미 DB에 수집되어 있습니다."
 
-    # 3. 누락분 수집 시작
     temp_list = []
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -253,13 +256,11 @@ def process_market_data(mode="sp1500"):
 
     new_df = pd.DataFrame(temp_list)
     
-    # 4. 데이터 병합 (기존 데이터 + 신규 확보 데이터)
     if existing_df is not None and not existing_df.empty:
         if not new_df.empty:
             if '순위' in existing_df.columns: existing_df = existing_df.drop(columns=['순위'])
             if '순위' in new_df.columns: new_df = new_df.drop(columns=['순위'])
             combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-            # 혹시 모를 중복 완벽 제거
             combined_df = combined_df.drop_duplicates(subset=['종목'], keep='last')
         else: combined_df = existing_df
     else:
@@ -268,7 +269,6 @@ def process_market_data(mode="sp1500"):
     if combined_df.empty:
         raise ValueError("수집된 데이터가 없습니다. 야후 서버 차단을 의심해보세요.")
 
-    # 5. 메트릭 재정렬 및 섹터 PER 업데이트
     if 'PER' in combined_df.columns and '섹터' in combined_df.columns:
         valid_per_df = combined_df[combined_df['PER'] > 0]
         sector_per_map = valid_per_df.groupby('섹터')['PER'].mean().round(1).to_dict()
@@ -298,7 +298,18 @@ def fetch_overnight_news():
         spy = yf.Ticker("SPY")
         news = spy.news
         if not news: return []
-        return news[:5]
+        
+        cleaned_news = []
+        for item in news[:5]:
+            title = item.get('title', 'No Title')
+            link = item.get('link', '#')
+            # 💡 [해결] 야후 파이낸스의 다양한 출처 제공 방식 대응
+            publisher = item.get('publisher') or item.get('provider') or item.get('source') or 'Yahoo Finance'
+            if isinstance(publisher, dict):
+                publisher = publisher.get('displayName', 'Yahoo Finance')
+            cleaned_news.append({'title': title, 'link': link, 'publisher': publisher})
+            
+        return cleaned_news
     except Exception as e:
         logger.error(f"News fetch error: {e}")
         return []
@@ -357,6 +368,21 @@ if st.session_state['quant_data'] is None:
                         st.session_state['last_updated'], st.session_state['scan_msg'] = f"{updated_time} (전체확장)", msg
                         st.rerun()
                     except Exception as e: st.error(f"에러: {e}")
+        
+        st.markdown("---")
+        st.caption("또는 로컬에서 다운받아둔 완성된 DB(CSV)를 수동으로 동기화할 수 있습니다.")
+        uploaded_file = st.file_uploader("📥 완성된 CSV 수동 동기화", type=["csv"], label_visibility="collapsed")
+        if uploaded_file is not None:
+            try:
+                df = pd.read_csv(uploaded_file)
+                valid_df = df[df['PER'] > 0] if 'PER' in df.columns else df
+                sector_map = valid_df.groupby('섹터')['PER'].mean().round(1).to_dict() if '섹터' in df.columns else {}
+                if '섹터' in df.columns: df['섹터평균_PER'] = df['섹터'].map(sector_map).fillna(0.0)
+                save_global_data(df, sector_map, "수동 파일 동기화 완료")
+                st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
+                st.session_state['last_updated'], st.session_state['scan_msg'] = "수동 파일 동기화 완료", "✅ 수동 백업 데이터 로드 성공!"
+                st.rerun()
+            except Exception as e: st.error(f"업로드 에러: {e}")
         st.stop()
         
     else:
