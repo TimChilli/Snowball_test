@@ -2,12 +2,11 @@
 ===============================================================================
 Project: SnowBall Quant Terminal (Web Edition)
 Author: TeamChilli
-Version: 12.0 (Smart Block Detection & 1500-Chunk System)
+Version: 12.1 (TypeError Bulletproof Patch for Live Search)
 Description: 
-    - 거짓 IP 차단 오탐지 완벽 해결 (Error vs Filtered 상태 명확히 분리)
-    - 미국 전체(6000+) 수집 청크 사이즈 1500개로 대폭 상향
-    - 불필요한 증시 뉴스 탭 전면 삭제
-    - 케이만 제도, 버뮤다 등 조세회피처 블랙리스트 추가로 편법 우회상장 중국주(API 등) 완벽 박멸
+    - 야후 파이낸스 데이터 누락(None, NaN) 시 발생하는 TypeError 완벽 차단
+    - sector, industry 등 텍스트 기반 조건문에 str() 강제 형변환 및 or 연산자 안전장치 적용
+    - 미국 전체(6000+) 수집 청크 1500개 유지 및 ADR 필터링 유지
 ===============================================================================
 """
 
@@ -128,25 +127,19 @@ def get_cached_us_full_tickers():
 # 5. 피터 린치 코어 분석 엔진
 # =============================================================================
 def calculate_single_stock_lynch_model(tk):
-    """
-    정상 수집 시: dict 반환
-    규칙에 의해 의도적으로 버려질 때: "FILTERED" 반환
-    야후 서버 통신 에러/누락 시: "ERROR" 반환
-    """
     try:
         s = yf.Ticker(tk)
         info = s.info
         
-        # 기본 정보 자체가 없으면 야후 서버의 데이터 누락/통신 에러
         if not info or 'symbol' not in info: 
             return "ERROR"
         
-        sector = info.get('sector', 'Unknown')
-        industry = info.get('industry', 'Unknown')
+        # 💡 [방어코드] 야후가 None을 던져도 뻗지 않도록 무조건 문자열 처리
+        sector = str(info.get('sector') or 'Unknown')
+        industry = str(info.get('industry') or 'Unknown')
         if sector in ['Financial Services', 'Real Estate']: return "FILTERED"
         
-        country = info.get('country', 'Unknown').upper()
-        # 💡 [패치] 중국계 우회상장 조세회피처(케이만, 버뮤다 등) 블랙리스트 전격 추가
+        country = str(info.get('country') or 'Unknown').upper()
         blocked_countries = [
             'CHINA', 'HONG KONG', 'TAIWAN', 'MACAU', 'RUSSIA', 'BRAZIL', 
             'INDIA', 'ARGENTINA', 'MEXICO', 'SOUTH KOREA', 'SOUTH AFRICA', 
@@ -154,9 +147,9 @@ def calculate_single_stock_lynch_model(tk):
         ]
         if country in blocked_countries: return "FILTERED"
         
-        short_name = info.get('shortName', '').upper()
-        long_name = info.get('longName', '').upper()
-        quote_type = info.get('quoteType', '')
+        short_name = str(info.get('shortName') or '').upper()
+        long_name = str(info.get('longName') or '').upper()
+        quote_type = str(info.get('quoteType') or '')
         
         if quote_type == 'ADR': return "FILTERED"
         name_str = f"{short_name} {long_name}"
@@ -241,11 +234,10 @@ def process_market_data(target_tickers, expected_time="10~15분"):
         
         raw_data = calculate_single_stock_lynch_model(tk)
         
-        # 💡 [패치] 에러(통신실패)와 필터링(조건미달)을 명확히 구분하여 거짓 차단 완벽 방지
         if raw_data == "ERROR":
             error_streak += 1 
         elif raw_data == "FILTERED":
-            error_streak = 0 # 정상 통신이지만 우리가 버린 것이므로 차단 카운터 리셋!
+            error_streak = 0 
         else:
             temp_list.append(raw_data)
             error_streak = 0 
@@ -256,7 +248,6 @@ def process_market_data(target_tickers, expected_time="10~15분"):
             m, s = divmod(elapsed, 60)
             status_text.text(f"수집 중: {i}/{total}개 | 신규 확보: {len(temp_list)}개 | 예상: {expected_time} | 소요시간: {m}분 {s}초")
             
-        # 연속 50개의 티커가 진짜 통신 에러일 때만 차단으로 간주
         if error_streak >= 50:
             interrupted = True
             break
@@ -358,7 +349,7 @@ def render_admin_panel():
         st.caption("아래에서 원하는 그룹을 선택하여 핀포인트로 수집하세요.")
         
         us_tks = get_cached_us_full_tickers()
-        chunk_size = 1500 # 💡 1500개 덩어리로 대폭 상향
+        chunk_size = 1500
         total_chunks = (len(us_tks) + chunk_size - 1) // chunk_size
         
         chunk_options = {}
@@ -505,10 +496,11 @@ with tab3:
                 price = float(row['현재주가($)'])
                 net_cash_per_share = float(row['주당순현금($)'])
                 ratio = float(row['순현금비율(%)'])
-                sector = row.get('섹터', 'Unknown')
-                industry = row.get('산업', 'Unknown')
+                sector = str(row.get('섹터', 'Unknown'))
+                industry = str(row.get('산업', 'Unknown'))
                 ocf = float(row.get('영업현금(M$)', 0.0))
                 
+                # 💡 [방어코드] 문자열 여부 확실히 보장 후 조건문 실행
                 if sector == 'Healthcare' or 'Bio' in industry:
                     if ocf < 0:
                         st.warning(f"⚠️ **[바이오/헬스케어 주의보]** 이 기업은 현재 영업현금흐름이 적자({ocf:,.1f} M$)입니다. 보유한 순현금은 임상/연구로 타들어갈 '땔감(Cash Burn)'일 확률이 높습니다.")
@@ -550,12 +542,12 @@ with tab3:
                 elif raw == "FILTERED":
                     st.error("데이터 부족, 상장폐지, 또는 순현금 분석에서 제외되는 조건(금융, 우회상장 ADR, 초소형 등)입니다.")
                 else:
-                    price = raw['현재주가($)']
-                    net_cash_per_share = raw['주당순현금($)']
-                    ratio = raw['순현금비율(%)']
-                    sector = raw['섹터']
-                    industry = raw['산업']
-                    ocf = raw['영업현금(M$)']
+                    price = float(raw['현재주가($)'])
+                    net_cash_per_share = float(raw['주당순현금($)'])
+                    ratio = float(raw['순현금비율(%)'])
+                    sector = str(raw['섹터'])
+                    industry = str(raw['산업'])
+                    ocf = float(raw['영업현금(M$)'])
                     sec_avg_per = st.session_state.get('sector_per_map', {}).get(sector, 0.0)
                     
                     if sector == 'Healthcare' or 'Bio' in industry:
