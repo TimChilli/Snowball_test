@@ -2,11 +2,11 @@
 ===============================================================================
 Project: SnowBall Quant Terminal (Web Edition)
 Author: TeamChilli
-Version: 11.6 (Persistent Uploader & Robust News Parser Patch)
+Version: 11.7 (News Removed & 500-Chunk Safe Scraper)
 Description: 
-    - DB가 채워진 상태(메인 탭)에서도 CSV 업로드 버튼이 상시 노출되도록 패치
-    - yfinance 최신 뉴스 API 구조 변동 대응 (Dictionary/Provider 다중 파싱 방어)
-    - S&P 1500 -> 미국 전체(6000+) 누적(Expand) 시스템 및 ADR 필터 유지
+    - 불필요한 간밤의 증시 헤드라인 탭 삭제
+    - 미국 전체(6000+) 수집 시 야후 서버 밴/타임아웃 방지를 위한 500개 단위 청크 분할 수집 적용
+    - ADR 완벽 필터링 및 누적(Expand) 아키텍처 유지
 ===============================================================================
 """
 
@@ -190,13 +190,12 @@ def calculate_single_stock_lynch_model(tk):
         '순현금_PER': round(net_cash_per, 2)
     }
 
-def process_market_data(mode="sp1500"):
+def process_market_data(mode="sp1500", limit=None):
+    """💡 [핵심] limit 옵션을 받아 지정된 개수(예: 500개) 단위로 안전하게 분할 수집합니다."""
     if mode == "full":
         target_tickers = get_us_full_tickers()
-        expected_time = "1~2시간"
     else:
         target_tickers = fetch_sp1500_tickers()
-        expected_time = "10~15분"
         
     if not target_tickers: raise ValueError("티커 목록을 가져오지 못했습니다.")
 
@@ -208,6 +207,11 @@ def process_market_data(mode="sp1500"):
             processed_tickers = set(existing_df['종목'].dropna().tolist())
     
     tickers_to_process = [tk for tk in target_tickers if tk not in processed_tickers]
+    
+    # 💡 [청크 분할] 남은 타겟이 limit(500)보다 크면, 앞에서부터 딱 500개까지만 자름
+    if limit and len(tickers_to_process) > limit:
+        tickers_to_process = tickers_to_process[:limit]
+        
     total = len(tickers_to_process)
     
     if total == 0:
@@ -238,7 +242,7 @@ def process_market_data(mode="sp1500"):
             progress_bar.progress(i / total)
             elapsed = int(time.time() - start_time)
             m, s = divmod(elapsed, 60)
-            status_text.text(f"수집 중: {i}/{total}개 | 신규 확보: {len(temp_list)}개 | 예상: {expected_time} | 소요시간: {m}분 {s}초")
+            status_text.text(f"수집 중: {i}/{total}개 | 신규 확보: {len(temp_list)}개 | 소요시간: {m}분 {s}초")
             
         if error_streak >= 30:
             interrupted = True
@@ -283,40 +287,11 @@ def process_market_data(mode="sp1500"):
     db_total = len(combined_df)
     
     if interrupted:
-        msg = f"🚨 야후 IP 차단 감지! 임시 저장됨. (신규 추가: {added_count}개 | 현재 DB 총: {db_total}개 | 남은 타겟: {total - i}개) ➡️ 잠시 후 다시 버튼을 눌러 이어가세요."
+        msg = f"🚨 야후 IP 차단 감지! 임시 저장됨. (이번 턴 추가: {added_count}개 | 현재 DB: {db_total}개) ➡️ 잠시 후 다시 버튼을 눌러주세요."
     else:
-        msg = f"✅ 수집 완료! (신규 추가: {added_count}개 | 현재 DB 총: {db_total}개 | 소요시간: {elapsed_str})"
+        msg = f"✅ 수집 완료! (이번 턴 추가: {added_count}개 | 현재 DB: {db_total}개 | 소요시간: {elapsed_str})"
         
     return combined_df, sector_per_map, update_time, msg
-
-@st.cache_data(ttl=1800)
-def fetch_overnight_news():
-    """💡 [패치] 야후 파이낸스 뉴스 출처(Publisher) 다중 파싱 로직 강화"""
-    try:
-        spy = yf.Ticker("SPY")
-        news = spy.news
-        if not news: return []
-        
-        cleaned_news = []
-        for item in news[:5]:
-            title = item.get('title') or item.get('headline') or 'No Title'
-            link = item.get('link') or item.get('url') or '#'
-            
-            # API 구조 변경 대비 다양한 출처 변수(Key) 순차 탐색
-            publisher = item.get('publisher') or item.get('provider') or item.get('source')
-            
-            # 딕셔너리 형태로 들어올 경우(예: {'displayName': 'Bloomberg'}) 추출
-            if isinstance(publisher, dict):
-                publisher = publisher.get('displayName', 'Yahoo Finance')
-            elif not publisher:
-                publisher = 'Market News'
-                
-            cleaned_news.append({'title': title, 'link': link, 'publisher': publisher})
-            
-        return cleaned_news
-    except Exception as e:
-        logger.error(f"News fetch error: {e}")
-        return []
 
 # =============================================================================
 # 6. 세션 상태 및 라우팅 컨트롤러
@@ -353,7 +328,7 @@ if st.session_state['quant_data'] is None:
             if st.button("🚀 S&P 1500 스캔 (부족분 자동추가)", key="init_sp", use_container_width=True):
                 with st.spinner("S&P 1500 수집 중..."):
                     try:
-                        df, sector_map, updated_time, msg = process_market_data(mode="sp1500")
+                        df, sector_map, updated_time, msg = process_market_data(mode="sp1500", limit=None)
                         save_global_data(df, sector_map, updated_time)
                         st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
                         st.session_state['last_updated'], st.session_state['scan_msg'] = updated_time, msg
@@ -362,14 +337,15 @@ if st.session_state['quant_data'] is None:
                     
         with col2:
             st.subheader("2단계: 미국 전체 확장 수집")
-            st.caption("기존 DB를 유지한 채 나머지 4500여 개 소형주 추가 (1~2시간)")
-            if st.button("🔥 미국 전체 스캔 확장", key="init_full", type="primary", use_container_width=True):
-                with st.spinner("미국 전체 주식 확장 수집 중..."):
+            st.caption("안정성을 위해 한 번에 **최대 500개씩만 쪼개서** 수집합니다.")
+            if st.button("🔥 전체 확장 (500개씩 분할 수집)", key="init_full", type="primary", use_container_width=True):
+                with st.spinner("미국 소형주 500개 분할 수집 중..."):
                     try:
-                        df, sector_map, updated_time, msg = process_market_data(mode="full")
-                        save_global_data(df, sector_map, f"{updated_time} (전체확장)")
+                        # 💡 [핵심] limit=500 설정으로 안전빵 확보!
+                        df, sector_map, updated_time, msg = process_market_data(mode="full", limit=500)
+                        save_global_data(df, sector_map, f"{updated_time} (확장 중)")
                         st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
-                        st.session_state['last_updated'], st.session_state['scan_msg'] = f"{updated_time} (전체확장)", msg
+                        st.session_state['last_updated'], st.session_state['scan_msg'] = f"{updated_time} (확장 중)", msg
                         st.rerun()
                     except Exception as e: st.error(f"에러: {e}")
         
@@ -404,18 +380,6 @@ st.caption(f"최근 데이터 동기화: {st.session_state['last_updated']}")
 tab1, tab2, tab3 = st.tabs(["대시보드", "Net Cash 랭킹 보드", "개별 종목 딥다이브"])
 
 with tab1:
-    st.markdown("### 📰 간밤의 미국 증시 헤드라인 (SPY)")
-    news_list = fetch_overnight_news()
-    if news_list:
-        for item in news_list:
-            title = item.get('title', 'No Title')
-            link = item.get('link', '#')
-            publisher = item.get('publisher', 'Unknown')
-            st.markdown(f"- [{title}]({link}) *(출처: {publisher})*")
-    else:
-        st.info("현재 불러올 수 있는 최신 뉴스가 없습니다.")
-    st.divider()
-
     st.subheader("💡 피터 린치의 오리지널 순현금 모델")
     st.markdown('''
     "어떤 회사의 주당 순현금이 3달러이고 주가가 10달러라면, 당신은 이 주식을 10달러가 아니라 **실질적으로 7달러**에 사는 것이다." 
@@ -441,21 +405,22 @@ with tab1:
             if st.button("🚀 S&P 1500 스캔 (부족분 자동추가)", use_container_width=True):
                 with st.spinner("S&P 1500 누락 종목 수집 중..."):
                     try:
-                        df, sector_map, updated_time, msg = process_market_data(mode="sp1500")
+                        df, sector_map, updated_time, msg = process_market_data(mode="sp1500", limit=None)
                         save_global_data(df, sector_map, updated_time)
                         st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
                         st.session_state['last_updated'], st.session_state['scan_msg'] = updated_time, msg
                         st.rerun()
                     except Exception as e: st.error(f"에러: {e}")
         with col2:
-            st.markdown("##### 2단계: 미국 전체(6000+) 확장")
-            if st.button("🔥 미국 전체 스캔 확장", type="primary", use_container_width=True):
-                with st.spinner("미국 전체 주식 확장 수집 중..."):
+            st.markdown("##### 2단계: 미국 전체 확장")
+            if st.button("🔥 전체 확장 (500개 단위 분할 수집)", type="primary", use_container_width=True):
+                with st.spinner("미국 소형주 500개 분할 수집 중..."):
                     try:
-                        df, sector_map, updated_time, msg = process_market_data(mode="full")
-                        save_global_data(df, sector_map, f"{updated_time} (전체확장)")
+                        # 💡 [핵심] limit=500 설정으로 안전빵 확보!
+                        df, sector_map, updated_time, msg = process_market_data(mode="full", limit=500)
+                        save_global_data(df, sector_map, f"{updated_time} (확장 중)")
                         st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
-                        st.session_state['last_updated'], st.session_state['scan_msg'] = f"{updated_time} (전체확장)", msg
+                        st.session_state['last_updated'], st.session_state['scan_msg'] = f"{updated_time} (확장 중)", msg
                         st.rerun()
                     except Exception as e: st.error(f"에러: {e}")
         
@@ -468,10 +433,7 @@ with tab1:
                 st.rerun()
                 
         st.markdown("---")
-        
-        # 💡 [패치 완료] DB가 있는 메인 화면에서도 로컬 DB 업로드 버튼이 항상 보이도록 배치
         st.markdown("##### 📁 로컬 DB 수동 업로드 및 백업")
-        
         col_dl, col_up = st.columns(2)
         with col_dl:
             if st.session_state['quant_data'] is not None:
