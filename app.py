@@ -2,10 +2,11 @@
 ===============================================================================
 Project: SnowBall Quant Terminal (Web Edition)
 Author: TeamChilli
-Version: 11.5 (Advanced ADS/ADR Filter Patch)
+Version: 11.6 (Persistent Uploader & Robust News Parser Patch)
 Description: 
-    - BILI, ATAT 등 ADS(American Depositary Shares) 종목 완벽 차단
-    - 'ADR', 'ADS', 'DEPOSITARY', 'DEPOSITORY' 키워드 전면 필터링
+    - DB가 채워진 상태(메인 탭)에서도 CSV 업로드 버튼이 상시 노출되도록 패치
+    - yfinance 최신 뉴스 API 구조 변동 대응 (Dictionary/Provider 다중 파싱 방어)
+    - S&P 1500 -> 미국 전체(6000+) 누적(Expand) 시스템 및 ADR 필터 유지
 ===============================================================================
 """
 
@@ -128,11 +129,9 @@ def calculate_single_stock_lynch_model(tk):
     s = yf.Ticker(tk)
     info = s.info
     
-    # 💡 [필터링 1] 금융/리츠 제외
     sector = info.get('sector', 'Unknown')
     if sector in ['Financial Services', 'Real Estate']: return None
     
-    # 💡 [필터링 2] ADR 및 ADS (BILI, ATAT 등) 완벽 차단망
     short_name = info.get('shortName', '').upper()
     long_name = info.get('longName', '').upper()
     quote_type = info.get('quoteType', '')
@@ -149,7 +148,6 @@ def calculate_single_stock_lynch_model(tk):
     shares = info.get('impliedSharesOutstanding') or info.get('sharesOutstanding')
     market_cap = info.get('marketCap', 0)
     
-    # 💡 [필터링 3] 페니스탁 및 데이터 찌꺼기 차단
     if not price or not shares or shares == 0 or bs is None or bs.empty: return None
     if price < 1.0 or market_cap < 50000000: return None
         
@@ -164,7 +162,6 @@ def calculate_single_stock_lynch_model(tk):
     net_cash_per_share = net_cash / shares
     net_cash_ratio = (net_cash_per_share / price) * 100
     
-    # 💡 [필터링 4] 비정상 비율 차단 (500% 초과는 회계 에러로 간주)
     if net_cash_ratio > 500: return None
     
     consecutive_growth = 0
@@ -294,6 +291,7 @@ def process_market_data(mode="sp1500"):
 
 @st.cache_data(ttl=1800)
 def fetch_overnight_news():
+    """💡 [패치] 야후 파이낸스 뉴스 출처(Publisher) 다중 파싱 로직 강화"""
     try:
         spy = yf.Ticker("SPY")
         news = spy.news
@@ -301,12 +299,18 @@ def fetch_overnight_news():
         
         cleaned_news = []
         for item in news[:5]:
-            title = item.get('title', 'No Title')
-            link = item.get('link', '#')
-            # 💡 [해결] 야후 파이낸스의 다양한 출처 제공 방식 대응
-            publisher = item.get('publisher') or item.get('provider') or item.get('source') or 'Yahoo Finance'
+            title = item.get('title') or item.get('headline') or 'No Title'
+            link = item.get('link') or item.get('url') or '#'
+            
+            # API 구조 변경 대비 다양한 출처 변수(Key) 순차 탐색
+            publisher = item.get('publisher') or item.get('provider') or item.get('source')
+            
+            # 딕셔너리 형태로 들어올 경우(예: {'displayName': 'Bloomberg'}) 추출
             if isinstance(publisher, dict):
                 publisher = publisher.get('displayName', 'Yahoo Finance')
+            elif not publisher:
+                publisher = 'Market News'
+                
             cleaned_news.append({'title': title, 'link': link, 'publisher': publisher})
             
         return cleaned_news
@@ -381,6 +385,7 @@ if st.session_state['quant_data'] is None:
                 save_global_data(df, sector_map, "수동 파일 동기화 완료")
                 st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
                 st.session_state['last_updated'], st.session_state['scan_msg'] = "수동 파일 동기화 완료", "✅ 수동 백업 데이터 로드 성공!"
+                time.sleep(1)
                 st.rerun()
             except Exception as e: st.error(f"업로드 에러: {e}")
         st.stop()
@@ -463,9 +468,29 @@ with tab1:
                 st.rerun()
                 
         st.markdown("---")
-        if st.session_state['quant_data'] is not None:
-            csv_data = st.session_state['quant_data'].to_csv(index=False).encode('utf-8-sig')
-            st.download_button("📥 현재 완성된 DB 로컬 다운로드 (CSV 백업용)", data=csv_data, file_name=f"PeterLynch_NetCash_Backup_{datetime.datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
+        
+        # 💡 [패치 완료] DB가 있는 메인 화면에서도 로컬 DB 업로드 버튼이 항상 보이도록 배치
+        st.markdown("##### 📁 로컬 DB 수동 업로드 및 백업")
+        
+        col_dl, col_up = st.columns(2)
+        with col_dl:
+            if st.session_state['quant_data'] is not None:
+                csv_data = st.session_state['quant_data'].to_csv(index=False).encode('utf-8-sig')
+                st.download_button("📥 현재 완성된 DB 로컬 다운로드 (CSV 백업용)", data=csv_data, file_name=f"PeterLynch_NetCash_Backup_{datetime.datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
+        with col_up:
+            uploaded_file = st.file_uploader("📤 완성된 CSV 수동 덮어쓰기", type=["csv"], label_visibility="collapsed")
+            if uploaded_file is not None:
+                try:
+                    df = pd.read_csv(uploaded_file)
+                    valid_df = df[df['PER'] > 0] if 'PER' in df.columns else df
+                    sector_map = valid_df.groupby('섹터')['PER'].mean().round(1).to_dict() if '섹터' in df.columns else {}
+                    if '섹터' in df.columns: df['섹터평균_PER'] = df['섹터'].map(sector_map).fillna(0.0)
+                    save_global_data(df, sector_map, "수동 파일 동기화 완료")
+                    st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
+                    st.session_state['last_updated'], st.session_state['scan_msg'] = "수동 파일 동기화 완료", "✅ 수동 백업 데이터 로드 성공!"
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e: st.error(f"업로드 에러: {e}")
 
 with tab2:
     db_size = len(st.session_state['quant_data']) if st.session_state['quant_data'] is not None else 0
