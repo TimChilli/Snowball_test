@@ -2,11 +2,12 @@
 ===============================================================================
 Project: SnowBall Quant Terminal (Web Edition)
 Author: TeamChilli
-Version: 11.9 (Ultimate ADR/ADS Eradication & Country Blacklist)
+Version: 12.0 (Smart Block Detection & 1500-Chunk System)
 Description: 
-    - 야후 파이낸스에서 이름을 위장한 중국계 ADS(BILI, ATAT 등)를 잡아내기 위한 국적(Country) 블랙리스트 추가
-    - 'QUADRANT' 등 정상 단어의 오탐지를 막기 위해 Regex(정규식) 기반 Word Boundary 필터링 적용
-    - 재무제표 통화(Currency) 환산 오류로 인한 5000%+ 기형 데이터 원천 차단
+    - 거짓 IP 차단 오탐지 완벽 해결 (Error vs Filtered 상태 명확히 분리)
+    - 미국 전체(6000+) 수집 청크 사이즈 1500개로 대폭 상향
+    - 불필요한 증시 뉴스 탭 전면 삭제
+    - 케이만 제도, 버뮤다 등 조세회피처 블랙리스트 추가로 편법 우회상장 중국주(API 등) 완벽 박멸
 ===============================================================================
 """
 
@@ -87,7 +88,7 @@ def get_bs_value(bs, possible_keys):
     return 0.0
 
 # =============================================================================
-# 4. 티커 수집 모듈 (캐싱 적용)
+# 4. 티커 수집 모듈
 # =============================================================================
 @st.cache_data(ttl=86400)
 def get_cached_sp1500_tickers():
@@ -127,80 +128,91 @@ def get_cached_us_full_tickers():
 # 5. 피터 린치 코어 분석 엔진
 # =============================================================================
 def calculate_single_stock_lynch_model(tk):
-    s = yf.Ticker(tk)
-    info = s.info
-    
-    # 💡 [필터링 1] 섹터 제외
-    sector = info.get('sector', 'Unknown')
-    if sector in ['Financial Services', 'Real Estate']: return None
-    
-    # 💡 [필터링 2] 국적(Country) 기반 야후 환율 오류/ADR 원천 차단
-    country = info.get('country', 'Unknown').upper()
-    blocked_countries = ['CHINA', 'HONG KONG', 'TAIWAN', 'MACAU', 'RUSSIA', 'BRAZIL', 'INDIA', 'ARGENTINA', 'MEXICO', 'SOUTH KOREA', 'SOUTH AFRICA']
-    if country in blocked_countries:
-        return None
-    
-    # 💡 [필터링 3] 정규식(Regex)을 이용한 오탐 없는 ADR/ADS 정밀 필터링
-    short_name = info.get('shortName', '').upper()
-    long_name = info.get('longName', '').upper()
-    quote_type = info.get('quoteType', '')
-    
-    if quote_type == 'ADR': return None
-    name_str = f"{short_name} {long_name}"
-    # 단어 경계(\b)를 사용하여 독립된 단어일 때만 차단 (예: QUADRANT 통과, BILI ADS 차단)
-    if re.search(r'\b(ADR|ADS|DEPOSITARY|DEPOSITORY|RECEIPT)\b', name_str):
-        return None
+    """
+    정상 수집 시: dict 반환
+    규칙에 의해 의도적으로 버려질 때: "FILTERED" 반환
+    야후 서버 통신 에러/누락 시: "ERROR" 반환
+    """
+    try:
+        s = yf.Ticker(tk)
+        info = s.info
         
-    bs = s.quarterly_balance_sheet
-    if bs is None or bs.empty: bs = s.balance_sheet
+        # 기본 정보 자체가 없으면 야후 서버의 데이터 누락/통신 에러
+        if not info or 'symbol' not in info: 
+            return "ERROR"
         
-    inc = s.financials
-    price = info.get('currentPrice') or info.get('previousClose')
-    shares = info.get('impliedSharesOutstanding') or info.get('sharesOutstanding')
-    market_cap = info.get('marketCap', 0)
-    
-    if not price or not shares or shares == 0 or bs is None or bs.empty: return None
-    if price < 1.0 or market_cap < 50000000: return None
+        sector = info.get('sector', 'Unknown')
+        industry = info.get('industry', 'Unknown')
+        if sector in ['Financial Services', 'Real Estate']: return "FILTERED"
         
-    cash_keys = ['Cash Cash Equivalents And Short Term Investments', 'Cash And Cash Equivalents', 'Cash Financial', 'Cash', 'Other Short Term Investments']
-    long_debt_keys = ['Long Term Debt Non Current', 'Long Term Debt', 'Total Debt Non Current', 'Total Long Term Debt', 'Current Debt And Capital Lease Obligation', 'Current Debt', 'Current Portion Of Long Term Debt']
-    
-    total_cash = get_bs_value(bs, cash_keys)
-    if total_cash == 0: total_cash = float(info.get('totalCash') or 0.0)
-    adjusted_long_debt = get_bs_value(bs, long_debt_keys)
-    
-    net_cash = total_cash - adjusted_long_debt
-    net_cash_per_share = net_cash / shares
-    net_cash_ratio = (net_cash_per_share / price) * 100
-    
-    # 💡 [필터링 4] 비정상 환율/데이터 단위 꼬임으로 인한 극단적 오류값 차단
-    if net_cash_ratio > 400: return None
-    
-    consecutive_growth = 0
-    if inc is not None and not inc.empty:
-        for key in ['Net Income', 'Net Income Common Stockholders']:
-            if key in inc.index:
-                ni_series = inc.loc[key].dropna()
-                if len(ni_series) > 1:
-                    ni_list = ni_series.tolist()
-                    for i in range(len(ni_list) - 1):
-                        if ni_list[i] > ni_list[i+1]: consecutive_growth += 1
-                        else: break
-                break
-    growth_str = '▲' * consecutive_growth if consecutive_growth > 0 else '-'
+        country = info.get('country', 'Unknown').upper()
+        # 💡 [패치] 중국계 우회상장 조세회피처(케이만, 버뮤다 등) 블랙리스트 전격 추가
+        blocked_countries = [
+            'CHINA', 'HONG KONG', 'TAIWAN', 'MACAU', 'RUSSIA', 'BRAZIL', 
+            'INDIA', 'ARGENTINA', 'MEXICO', 'SOUTH KOREA', 'SOUTH AFRICA', 
+            'CAYMAN ISLANDS', 'BERMUDA', 'BAHAMAS', 'BRITISH VIRGIN ISLANDS'
+        ]
+        if country in blocked_countries: return "FILTERED"
+        
+        short_name = info.get('shortName', '').upper()
+        long_name = info.get('longName', '').upper()
+        quote_type = info.get('quoteType', '')
+        
+        if quote_type == 'ADR': return "FILTERED"
+        name_str = f"{short_name} {long_name}"
+        if re.search(r'\b(ADR|ADS|DEPOSITARY|DEPOSITORY|RECEIPT)\b', name_str): return "FILTERED"
+            
+        bs = s.quarterly_balance_sheet
+        if bs is None or bs.empty: bs = s.balance_sheet
+            
+        inc = s.financials
+        price = info.get('currentPrice') or info.get('previousClose')
+        shares = info.get('impliedSharesOutstanding') or info.get('sharesOutstanding')
+        market_cap = info.get('marketCap', 0)
+        ocf = info.get('operatingCashflow', 0.0)
+        
+        if not price or not shares or shares == 0 or bs is None or bs.empty: return "FILTERED"
+        if price < 1.0 or market_cap < 50000000: return "FILTERED"
+            
+        cash_keys = ['Cash Cash Equivalents And Short Term Investments', 'Cash And Cash Equivalents', 'Cash Financial', 'Cash', 'Other Short Term Investments']
+        long_debt_keys = ['Long Term Debt Non Current', 'Long Term Debt', 'Total Debt Non Current', 'Total Long Term Debt', 'Current Debt And Capital Lease Obligation', 'Current Debt', 'Current Portion Of Long Term Debt']
+        
+        total_cash = get_bs_value(bs, cash_keys)
+        if total_cash == 0: total_cash = float(info.get('totalCash') or 0.0)
+        adjusted_long_debt = get_bs_value(bs, long_debt_keys)
+        
+        net_cash = total_cash - adjusted_long_debt
+        net_cash_per_share = net_cash / shares
+        net_cash_ratio = (net_cash_per_share / price) * 100
+        
+        if net_cash_ratio > 400: return "FILTERED"
+        
+        consecutive_growth = 0
+        if inc is not None and not inc.empty:
+            for key in ['Net Income', 'Net Income Common Stockholders']:
+                if key in inc.index:
+                    ni_series = inc.loc[key].dropna()
+                    if len(ni_series) > 1:
+                        ni_list = ni_series.tolist()
+                        for i in range(len(ni_list) - 1):
+                            if ni_list[i] > ni_list[i+1]: consecutive_growth += 1
+                            else: break
+                    break
+        growth_str = '▲' * consecutive_growth if consecutive_growth > 0 else '-'
 
-    trailing_pe, forward_pe, eps = info.get('trailingPE', 0), info.get('forwardPE', 0), info.get('trailingEps', 0)
-    net_cash_per = (price - net_cash_per_share) / eps if eps and eps > 0 else 0.0
-    
-    return {
-        '종목': tk, '기업명': info.get('shortName', info.get('longName', tk)), '섹터': sector,
-        '현재주가($)': price, '주당순현금($)': round(net_cash_per_share, 2), '순현금비율(%)': round(net_cash_ratio, 2),
-        '시가총액(M$)': round(market_cap / 1e6, 2) if market_cap else 0.0, '총현금(M$)': round(total_cash / 1e6, 2),
-        '실질장기부채(M$)': round(adjusted_long_debt / 1e6, 2), '순이익성장': growth_str,
-        'PER': round(trailing_pe, 2) if trailing_pe and trailing_pe > 0 else 0.0,
-        'Fwd_PER': round(forward_pe, 2) if forward_pe and forward_pe > 0 else 0.0,
-        '순현금_PER': round(net_cash_per, 2)
-    }
+        trailing_pe, forward_pe, eps = info.get('trailingPE', 0), info.get('forwardPE', 0), info.get('trailingEps', 0)
+        net_cash_per = (price - net_cash_per_share) / eps if eps and eps > 0 else 0.0
+        
+        return {
+            '종목': tk, '기업명': info.get('shortName', info.get('longName', tk)), '섹터': sector, '산업': industry,
+            '현재주가($)': price, '주당순현금($)': round(net_cash_per_share, 2), '순현금비율(%)': round(net_cash_ratio, 2),
+            '시가총액(M$)': round(market_cap / 1e6, 2) if market_cap else 0.0, '총현금(M$)': round(total_cash / 1e6, 2),
+            '실질장기부채(M$)': round(adjusted_long_debt / 1e6, 2), '영업현금(M$)': round(ocf / 1e6, 2) if ocf else 0.0,
+            '순이익성장': growth_str, 'PER': round(trailing_pe, 2) if trailing_pe and trailing_pe > 0 else 0.0,
+            'Fwd_PER': round(forward_pe, 2) if forward_pe and forward_pe > 0 else 0.0, '순현금_PER': round(net_cash_per, 2)
+        }
+    except Exception:
+        return "ERROR"
 
 def process_market_data(target_tickers, expected_time="10~15분"):
     existing_df = st.session_state.get('quant_data')
@@ -226,15 +238,17 @@ def process_market_data(target_tickers, expected_time="10~15분"):
 
     for i, tk in enumerate(tickers_to_process, 1):
         time.sleep(0.05) 
-        try:
-            raw_data = calculate_single_stock_lynch_model(tk)
-            if raw_data: 
-                temp_list.append(raw_data)
-                error_streak = 0 
-            else:
-                error_streak += 1 
-        except Exception as e:
+        
+        raw_data = calculate_single_stock_lynch_model(tk)
+        
+        # 💡 [패치] 에러(통신실패)와 필터링(조건미달)을 명확히 구분하여 거짓 차단 완벽 방지
+        if raw_data == "ERROR":
             error_streak += 1 
+        elif raw_data == "FILTERED":
+            error_streak = 0 # 정상 통신이지만 우리가 버린 것이므로 차단 카운터 리셋!
+        else:
+            temp_list.append(raw_data)
+            error_streak = 0 
         
         if i % 5 == 0 or i == total:
             progress_bar.progress(i / total)
@@ -242,7 +256,8 @@ def process_market_data(target_tickers, expected_time="10~15분"):
             m, s = divmod(elapsed, 60)
             status_text.text(f"수집 중: {i}/{total}개 | 신규 확보: {len(temp_list)}개 | 예상: {expected_time} | 소요시간: {m}분 {s}초")
             
-        if error_streak >= 30:
+        # 연속 50개의 티커가 진짜 통신 에러일 때만 차단으로 간주
+        if error_streak >= 50:
             interrupted = True
             break
 
@@ -291,23 +306,6 @@ def process_market_data(target_tickers, expected_time="10~15분"):
         
     return combined_df, sector_per_map, update_time, msg
 
-@st.cache_data(ttl=1800)
-def fetch_overnight_news():
-    try:
-        spy = yf.Ticker("SPY")
-        news = spy.news
-        if not news: return []
-        cleaned_news = []
-        for item in news[:5]:
-            title = item.get('title') or item.get('headline') or 'No Title'
-            link = item.get('link') or item.get('url') or '#'
-            publisher = item.get('publisher') or item.get('provider') or item.get('source')
-            if isinstance(publisher, dict): publisher = publisher.get('displayName', 'Yahoo Finance')
-            elif not publisher: publisher = 'Market News'
-            cleaned_news.append({'title': title, 'link': link, 'publisher': publisher})
-        return cleaned_news
-    except Exception: return []
-
 # =============================================================================
 # 6. 세션 상태 및 그룹 UI 렌더링 함수
 # =============================================================================
@@ -345,7 +343,7 @@ def render_admin_panel():
         sp_done = len([t for t in sp_tks if t in db_tickers])
         st.caption(f"현재 S&P 1500 종목 확보량: **{sp_done} / {len(sp_tks)}**")
         
-        if st.button("🚀 S&P 1500 그룹 전체 스캔 (부족분 보충)", use_container_width=True):
+        if st.button("🚀 S&P 1500 전체 스캔 (부족분 보충)", use_container_width=True):
             with st.spinner("S&P 1500 누락 종목 수집 중..."):
                 try:
                     df, sector_map, updated_time, msg = process_market_data(sp_tks, "10~15분")
@@ -360,7 +358,7 @@ def render_admin_panel():
         st.caption("아래에서 원하는 그룹을 선택하여 핀포인트로 수집하세요.")
         
         us_tks = get_cached_us_full_tickers()
-        chunk_size = 500
+        chunk_size = 1500 # 💡 1500개 덩어리로 대폭 상향
         total_chunks = (len(us_tks) + chunk_size - 1) // chunk_size
         
         chunk_options = {}
@@ -373,13 +371,13 @@ def render_admin_panel():
             label = f"그룹 {i+1} ({start_idx+1} ~ {end_idx}) - [수집완료: {done_cnt} / {len(chunk_slice)}]"
             chunk_options[label] = chunk_slice
             
-        selected_chunk_label = st.selectbox("📌 500개 단위 그룹 선택", options=list(chunk_options.keys()), label_visibility="collapsed")
+        selected_chunk_label = st.selectbox("📌 1500개 단위 그룹 선택", options=list(chunk_options.keys()), label_visibility="collapsed")
         selected_chunk_tickers = chunk_options[selected_chunk_label]
         
         if st.button("🔥 선택한 그룹 스캔", type="primary", use_container_width=True):
             with st.spinner(f"해당 그룹의 누락 종목을 수집 중입니다..."):
                 try:
-                    df, sector_map, updated_time, msg = process_market_data(selected_chunk_tickers, "10~15분")
+                    df, sector_map, updated_time, msg = process_market_data(selected_chunk_tickers, "20~30분")
                     save_global_data(df, sector_map, f"{updated_time} (그룹 스캔)")
                     st.session_state['quant_data'], st.session_state['sector_per_map'] = df, sector_map
                     st.session_state['last_updated'], st.session_state['scan_msg'] = f"{updated_time} (그룹 스캔)", msg
@@ -408,7 +406,7 @@ def render_admin_panel():
                 st.rerun()
             except Exception as e: st.error(f"업로드 에러: {e}")
     with c_rst:
-        if st.button("🗑️ DB 리셋", help="처음부터 백지 상태에서 다시 시작합니다.", use_container_width=True):
+        if st.button("🗑️ DB 리셋", help="처음부터 다시 스캔하거나, 스키마 오류를 해결할 때 사용하세요.", use_container_width=True):
             clear_global_data()
             st.session_state['quant_data'] = None
             st.session_state['scan_msg'] = ""
@@ -437,18 +435,6 @@ st.caption(f"최근 데이터 동기화: {st.session_state['last_updated']}")
 tab1, tab2, tab3 = st.tabs(["대시보드", "Net Cash 랭킹 보드", "개별 종목 딥다이브"])
 
 with tab1:
-    st.markdown("### 📰 간밤의 미국 증시 헤드라인 (SPY)")
-    news_list = fetch_overnight_news()
-    if news_list:
-        for item in news_list:
-            title = item.get('title', 'No Title')
-            link = item.get('link', '#')
-            publisher = item.get('publisher', 'Unknown')
-            st.markdown(f"- [{title}]({link}) *(출처: {publisher})*")
-    else:
-        st.info("현재 불러올 수 있는 최신 뉴스가 없습니다.")
-    st.divider()
-
     st.subheader("💡 피터 린치의 오리지널 순현금 모델")
     st.markdown('''
     "어떤 회사의 주당 순현금이 3달러이고 주가가 10달러라면, 당신은 이 주식을 10달러가 아니라 **실질적으로 7달러**에 사는 것이다." 
@@ -456,7 +442,7 @@ with tab1:
     
     * **순현금 공식:** (순수 현금 및 단기투자자산) - (순수 장기 부채 및 1년 내 만기도래분)
     * **순현금 PER:** (현재 주가 - 주당 순현금) / 1주당 순이익(EPS)
-    * **섹터 평균 PER:** 해당 업종 내 **흑자 기업(EPS > 0)**의 PER 평균값
+    * **영업현금(OCF):** 헬스케어/바이오 등 적자 기업의 가치 트랩(현금 소진)을 식별하는 궁극의 필터
     ''')
     st.divider()
     
@@ -472,12 +458,12 @@ with tab2:
         df = df[df['순현금비율(%)'] > 0] 
         
         display_cols = [
-            '순위', '종목', '기업명', '섹터', '시가총액(M$)', '순현금비율(%)', 
+            '순위', '종목', '기업명', '섹터', '산업', '시가총액(M$)', '순현금비율(%)', 
             'PER', 'Fwd_PER', '순현금_PER', '섹터평균_PER', '순이익성장', 
-            '현재주가($)', '주당순현금($)', '총현금(M$)', '실질장기부채(M$)'
+            '현재주가($)', '주당순현금($)', '총현금(M$)', '실질장기부채(M$)', '영업현금(M$)'
         ]
         for c in display_cols:
-            if c not in df.columns: df[c] = 0.0
+            if c not in df.columns: df[c] = 0.0 if 'M$' in c or 'PER' in c else 'Unknown'
         
         st.dataframe(
             df[display_cols].head(100),
@@ -487,6 +473,7 @@ with tab2:
                 "종목": st.column_config.TextColumn(width=80),
                 "기업명": st.column_config.TextColumn(width="medium"),
                 "섹터": st.column_config.TextColumn(width="medium"),
+                "산업": st.column_config.TextColumn(width="medium"),
                 "시가총액(M$)": st.column_config.NumberColumn(format="%,.0f M"),
                 "순현금비율(%)": st.column_config.ProgressColumn(format="%d%%", min_value=0, max_value=100),
                 "PER": st.column_config.NumberColumn(format="%,.1f"),
@@ -497,14 +484,15 @@ with tab2:
                 "현재주가($)": st.column_config.NumberColumn(format="$%,.2f"),
                 "주당순현금($)": st.column_config.NumberColumn(format="$%,.2f"),
                 "총현금(M$)": st.column_config.NumberColumn(format="%,.1f M"),
-                "실질장기부채(M$)": st.column_config.NumberColumn(format="%,.1f M")
+                "실질장기부채(M$)": st.column_config.NumberColumn(format="%,.1f M"),
+                "영업현금(M$)": st.column_config.NumberColumn(format="%,.1f M", help="(+)면 수익 창출, (-)면 현금 소진(Cash Burn)")
             }
         )
 
 with tab3:
     st.subheader("🔍 개별 종목 실시간 딥다이브")
     with st.form("search_form"):
-        ticker_input = st.text_input("분석할 티커를 입력하세요 (예: YELP, AAPL)")
+        ticker_input = st.text_input("분석할 티커를 입력하세요 (예: AAPL, META)")
         submit_btn = st.form_submit_button("분석 시작")
         
     if submit_btn and ticker_input:
@@ -517,14 +505,23 @@ with tab3:
                 price = float(row['현재주가($)'])
                 net_cash_per_share = float(row['주당순현금($)'])
                 ratio = float(row['순현금비율(%)'])
+                sector = row.get('섹터', 'Unknown')
+                industry = row.get('산업', 'Unknown')
+                ocf = float(row.get('영업현금(M$)', 0.0))
                 
+                if sector == 'Healthcare' or 'Bio' in industry:
+                    if ocf < 0:
+                        st.warning(f"⚠️ **[바이오/헬스케어 주의보]** 이 기업은 현재 영업현금흐름이 적자({ocf:,.1f} M$)입니다. 보유한 순현금은 임상/연구로 타들어갈 '땔감(Cash Burn)'일 확률이 높습니다.")
+                    else:
+                        st.info(f"💊 **[헬스케어 긍정적]** 헬스케어/바이오 섹터임에도 영업현금흐름이 흑자({ocf:,.1f} M$)인 건실한 기업입니다.")
+
                 if ratio > 50: summ = "엄청난 수준의 현금을 보유하고 있습니다. 회사 금고의 현금이 주가의 절반 이상을 보증합니다!"
                 elif ratio > 20: summ = "매우 건전한 상태입니다. 든든한 순현금이 하락장을 방어해 줄 것입니다."
                 elif ratio > 0: summ = "실질 장기부채보다 현금이 더 많아 재무적으로 안정적입니다."
                 else: summ = "현재 보유한 현금보다 갚아야 할 실질 장기부채가 더 많아 주당 순현금이 마이너스(-) 상태입니다."
 
                 st.success(f"### {row['기업명']} ({tk}) : 순현금비율 {ratio:,.1f}%")
-                st.caption(f"섹터: {row['섹터']} | 랭킹: 비금융 전체 {row['순위']}위")
+                st.caption(f"섹터: {sector} ({industry}) | 랭킹: 비금융 전체 {row['순위']}위")
                 st.info(f"💡 총평: {summ}")
                 
                 col1, col2, col3, col4 = st.columns(4)
@@ -542,50 +539,56 @@ with tab3:
                 col9, col10, col11 = st.columns(3)
                 col9.metric("총 현금 (Total Cash)", f"${float(row.get('총현금(M$)',0)):,.1f} M")
                 col10.metric("조정 장기부채 (Long Term)", f"${float(row.get('실질장기부채(M$)',0)):,.1f} M")
-                col11.metric("연간 순이익 성장", str(row.get('순이익성장','-')) if str(row.get('순이익성장','-')) != '-' else "성장 안함")
+                col11.metric("영업현금흐름 (OCF)", f"${ocf:,.1f} M", help="Cash Burn 여부 확인용")
                 
         else:
             st.warning(f"'{tk}'는 현재 DB에 없어 야후 파이낸스에서 실시간으로 재무제표를 조회합니다.")
             with st.spinner("야후 서버에서 정보 추출 중..."):
-                try:
-                    raw = calculate_single_stock_lynch_model(tk)
-                    if not raw:
-                        st.error("데이터 부족, 상장폐지, 또는 순현금 분석에서 제외되는 조건(금융, ADR, 초소형 등)입니다.")
-                    else:
-                        price = raw['현재주가($)']
-                        net_cash_per_share = raw['주당순현금($)']
-                        ratio = raw['순현금비율(%)']
-                        sec_avg_per = st.session_state.get('sector_per_map', {}).get(raw['섹터'], 0.0)
-                        
-                        if ratio > 50: summ = "엄청난 수준의 현금을 보유하고 있습니다. 회사 금고의 현금이 주가의 절반 이상을 보증합니다!"
-                        elif ratio > 20: summ = "매우 건전한 상태입니다. 든든한 순현금이 하락장을 방어해 줄 것입니다."
-                        elif ratio > 0: summ = "실질 장기부채보다 현금이 더 많아 재무적으로 안정적입니다."
-                        else: summ = "현재 보유한 현금보다 갚아야 할 실질 장기부채가 더 많아 주당 순현금이 마이너스(-) 상태입니다."
+                raw = calculate_single_stock_lynch_model(tk)
+                if raw == "ERROR":
+                    st.error("야후 서버 통신 에러이거나 티커 정보가 없습니다.")
+                elif raw == "FILTERED":
+                    st.error("데이터 부족, 상장폐지, 또는 순현금 분석에서 제외되는 조건(금융, 우회상장 ADR, 초소형 등)입니다.")
+                else:
+                    price = raw['현재주가($)']
+                    net_cash_per_share = raw['주당순현금($)']
+                    ratio = raw['순현금비율(%)']
+                    sector = raw['섹터']
+                    industry = raw['산업']
+                    ocf = raw['영업현금(M$)']
+                    sec_avg_per = st.session_state.get('sector_per_map', {}).get(sector, 0.0)
+                    
+                    if sector == 'Healthcare' or 'Bio' in industry:
+                        if ocf < 0:
+                            st.warning(f"⚠️ **[바이오/헬스케어 주의보]** 이 기업은 현재 영업현금흐름이 적자({ocf:,.1f} M$)입니다. 보유한 순현금은 임상/연구로 타들어갈 '땔감(Cash Burn)'일 확률이 높습니다.")
+                        else:
+                            st.info(f"💊 **[헬스케어 긍정적]** 헬스케어/바이오 섹터임에도 영업현금흐름이 흑자({ocf:,.1f} M$)인 건실한 기업입니다.")
+                    
+                    if ratio > 50: summ = "엄청난 수준의 현금을 보유하고 있습니다. 회사 금고의 현금이 주가의 절반 이상을 보증합니다!"
+                    elif ratio > 20: summ = "매우 건전한 상태입니다. 든든한 순현금이 하락장을 방어해 줄 것입니다."
+                    elif ratio > 0: summ = "실질 장기부채보다 현금이 더 많아 재무적으로 안정적입니다."
+                    else: summ = "현재 보유한 현금보다 갚아야 할 실질 장기부채가 더 많아 주당 순현금이 마이너스(-) 상태입니다."
 
-                        st.success(f"### {raw['기업명']} ({tk}) : 순현금비율 {ratio:,.1f}%")
-                        st.caption(f"섹터: {raw['섹터']} | (실시간 산출 데이터)")
-                        st.info(f"💡 총평: {summ}")
-                        
-                        col1, col2, col3, col4 = st.columns(4)
-                        col1.metric("현재 주가", f"${price:,.2f}")
-                        col2.metric("주당 순현금", f"${net_cash_per_share:,.2f}", f"{ratio:,.1f}% of Price")
-                        col3.metric("실질 매수단가", f"${max(0, price - net_cash_per_share):,.2f}", delta_color="inverse")
-                        col4.metric("시가총액 (Market Cap)", f"${raw['시가총액(M$)']:,.0f} M")
-                        
-                        col5, col6, col7, col8 = st.columns(4)
-                        col5.metric("PER (기본)", f"{raw['PER']:,.1f}" if raw['PER'] > 0 else "N/A")
-                        col6.metric("Forward PER", f"{raw['Fwd_PER']:,.1f}" if raw['Fwd_PER'] > 0 else "N/A")
-                        col7.metric("순현금 PER", f"{raw['순현금_PER']:,.1f}" if raw['순현금_PER'] > 0 else "N/A")
-                        col8.metric("섹터 평균 PER", f"{sec_avg_per:,.1f}" if sec_avg_per > 0 else "N/A")
-                        
-                        col9, col10, col11 = st.columns(3)
-                        col9.metric("총 현금 (Total Cash)", f"${raw['총현금(M$)']:,.1f} M")
-                        col10.metric("조정 장기부채 (Long Term)", f"${raw['실질장기부채(M$)']:,.1f} M")
-                        col11.metric("연간 순이익 성장", raw['순이익성장'] if raw['순이익성장'] != '-' else "성장 안함")
-                        
-                except Exception as e:
-                    logger.error(f"Live fetch error for {tk}: {e}")
-                    st.error("야후 서버 통신에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+                    st.success(f"### {raw['기업명']} ({tk}) : 순현금비율 {ratio:,.1f}%")
+                    st.caption(f"섹터: {sector} ({industry}) | (실시간 산출 데이터)")
+                    st.info(f"💡 총평: {summ}")
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("현재 주가", f"${price:,.2f}")
+                    col2.metric("주당 순현금", f"${net_cash_per_share:,.2f}", f"{ratio:,.1f}% of Price")
+                    col3.metric("실질 매수단가", f"${max(0, price - net_cash_per_share):,.2f}", delta_color="inverse")
+                    col4.metric("시가총액 (Market Cap)", f"${raw['시가총액(M$)']:,.0f} M")
+                    
+                    col5, col6, col7, col8 = st.columns(4)
+                    col5.metric("PER (기본)", f"{raw['PER']:,.1f}" if raw['PER'] > 0 else "N/A")
+                    col6.metric("Forward PER", f"{raw['Fwd_PER']:,.1f}" if raw['Fwd_PER'] > 0 else "N/A")
+                    col7.metric("순현금 PER", f"{raw['순현금_PER']:,.1f}" if raw['순현금_PER'] > 0 else "N/A")
+                    col8.metric("섹터 평균 PER", f"{sec_avg_per:,.1f}" if sec_avg_per > 0 else "N/A")
+                    
+                    col9, col10, col11 = st.columns(3)
+                    col9.metric("총 현금 (Total Cash)", f"${raw['총현금(M$)']:,.1f} M")
+                    col10.metric("조정 장기부채 (Long Term)", f"${raw['실질장기부채(M$)']:,.1f} M")
+                    col11.metric("영업현금흐름 (OCF)", f"${ocf:,.1f} M", help="Cash Burn 여부 확인용")
 
 # 푸터
 st.markdown("<br><br><br><div style='text-align: center; color: #888; font-size: 12px;'>powered by TeamChilli</div>", unsafe_allow_html=True)
