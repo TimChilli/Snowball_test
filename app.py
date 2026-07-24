@@ -436,18 +436,7 @@ st.caption(f"최근 데이터 동기화: {st.session_state['last_updated']}")
 
 tab1, tab2, tab3 = st.tabs(["대시보드", "Net Cash 랭킹 보드", "개별 종목 딥다이브"])
 
-with tab1:
-    st.markdown("### 📰 간밤의 미국 증시 헤드라인 (SPY)")
-    news_list = fetch_overnight_news()
-    if news_list:
-        for item in news_list:
-            title = item.get('title', 'No Title')
-            link = item.get('link', '#')
-            publisher = item.get('publisher', 'Unknown')
-            st.markdown(f"- [{title}]({link}) *(출처: {publisher})*")
-    else:
-        st.info("현재 불러올 수 있는 최신 뉴스가 없습니다.")
-    st.divider()
+
 
     st.subheader("💡 피터 린치의 오리지널 순현금 모델")
     st.markdown('''
