@@ -2,10 +2,11 @@
 ===============================================================================
 Project: SnowBall Quant Terminal (Web Edition)
 Author: TeamChilli
-Version: 11.2 (Smart Resume Bug Fix - Silent Block Detection)
+Version: 11.3 (ADR Filter, Anomaly Prevention & Market News)
 Description: 
-    - 야후 파이낸스의 'Silent Block(에러 없이 None 반환)' 완벽 감지 방어막 추가
-    - 연속 30종목 데이터 누락 시 즉각 IP 차단으로 간주하고 강제 비상 세이브
+    - ADR 종목, 페니스탁(1$ 미만), 초소형주(50M$ 미만) 및 비정상 비율(300%+) 원천 차단
+    - 상단 제목 폰트 사이즈 최적화
+    - 야후 API 기반 실시간 S&P 500 시장 뉴스 대시보드 탑재
 ===============================================================================
 """
 
@@ -88,6 +89,19 @@ def get_bs_value(bs, possible_keys):
                 return float(val)
     return 0.0
 
+@st.cache_data(ttl=1800) # 30분마다 뉴스 갱신
+def fetch_overnight_news():
+    """S&P 500 (SPY) 최신 시장 뉴스를 가져옵니다."""
+    try:
+        spy = yf.Ticker("SPY")
+        news = spy.news
+        if not news:
+            return []
+        return news[:5] # 상위 5개 헤드라인만 추출
+    except Exception as e:
+        logger.error(f"News fetch error: {e}")
+        return []
+
 # =============================================================================
 # 4. 티커 수집 모듈
 # =============================================================================
@@ -130,8 +144,10 @@ def calculate_single_stock_lynch_model(tk):
     s = yf.Ticker(tk)
     info = s.info
     
+    # 💡 [필터링 1] 금융/리츠 제외 및 ADR 종목 원천 차단
     sector = info.get('sector', 'Unknown')
     if sector in ['Financial Services', 'Real Estate']: return None
+    if info.get('quoteType') == 'ADR' or 'ADR' in info.get('shortName', '').upper(): return None
         
     bs = s.quarterly_balance_sheet
     if bs is None or bs.empty: bs = s.balance_sheet
@@ -141,7 +157,9 @@ def calculate_single_stock_lynch_model(tk):
     shares = info.get('impliedSharesOutstanding') or info.get('sharesOutstanding')
     market_cap = info.get('marketCap', 0)
     
+    # 💡 [필터링 2] 데이터 찌꺼기 방지 (가격 1달러 미만, 시총 5천만 달러 미만, 혹은 기본 데이터 누락 배제)
     if not price or not shares or shares == 0 or bs is None or bs.empty: return None
+    if price < 1.0 or market_cap < 50000000: return None
         
     cash_keys = ['Cash Cash Equivalents And Short Term Investments', 'Cash And Cash Equivalents', 'Cash Financial', 'Cash', 'Other Short Term Investments']
     long_debt_keys = ['Long Term Debt Non Current', 'Long Term Debt', 'Total Debt Non Current', 'Total Long Term Debt', 'Current Debt And Capital Lease Obligation', 'Current Debt', 'Current Portion Of Long Term Debt']
@@ -153,6 +171,9 @@ def calculate_single_stock_lynch_model(tk):
     net_cash = total_cash - adjusted_long_debt
     net_cash_per_share = net_cash / shares
     net_cash_ratio = (net_cash_per_share / price) * 100
+    
+    # 💡 [필터링 3] 야후 데이터 오류(단위 믹스)로 인한 5000% 등 비정상 수치 차단
+    if net_cash_ratio > 300: return None
     
     consecutive_growth = 0
     if inc is not None and not inc.empty:
@@ -193,7 +214,6 @@ def process_market_data(mode="sp1500", resume=False):
     existing_df = None
     processed_tickers = set()
     
-    # 이어서 수집(Resume) 켜져있을 경우 완료된 티커 필터링
     if resume and st.session_state.get('quant_data') is not None:
         existing_df = st.session_state['quant_data'].copy()
         if '종목' in existing_df.columns:
@@ -219,12 +239,12 @@ def process_market_data(mode="sp1500", resume=False):
             raw_data = calculate_single_stock_lynch_model(tk)
             if raw_data: 
                 temp_list.append(raw_data)
-                error_streak = 0 # 정상 수집 성공 시 에러(차단) 카운터 리셋
+                error_streak = 0 
             else:
-                error_streak += 1 # 💡 [버그 픽스] 데이터가 비어있어도 차단 누적으로 간주!
+                error_streak += 1 
         except Exception as e:
             logger.warning(f"Error fetching {tk}: {e}")
-            error_streak += 1 # 💡 에러가 나도 차단 누적으로 간주!
+            error_streak += 1 
         
         if i % 5 == 0 or i == total:
             progress_bar.progress(i / total)
@@ -232,7 +252,6 @@ def process_market_data(mode="sp1500", resume=False):
             m, s = divmod(elapsed, 60)
             status_text.text(f"수집 중: {i}/{total}개 | 신규 확보: {len(temp_list)}개 | 예상: {expected_time} | 소요시간: {m}분 {s}초")
             
-        # 💡 [핵심 보완] 야후 'Silent Block' 감지 (연속 30번 누락 시 즉각 멈춤)
         if error_streak >= 30:
             interrupted = True
             break
@@ -246,7 +265,6 @@ def process_market_data(mode="sp1500", resume=False):
 
     new_df = pd.DataFrame(temp_list)
     
-    # 기존 데이터와 신규 데이터 병합
     if existing_df is not None and not existing_df.empty:
         if not new_df.empty:
             if '순위' in existing_df.columns: existing_df = existing_df.drop(columns=['순위'])
@@ -259,14 +277,12 @@ def process_market_data(mode="sp1500", resume=False):
     if combined_df.empty:
         raise ValueError("수집된 데이터가 없습니다. 야후 서버 차단을 의심해보세요.")
 
-    # 섹터 평균 PER 재계산
     if 'PER' in combined_df.columns and '섹터' in combined_df.columns:
         valid_per_df = combined_df[combined_df['PER'] > 0]
         sector_per_map = valid_per_df.groupby('섹터')['PER'].mean().round(1).to_dict()
         combined_df['섹터평균_PER'] = combined_df['섹터'].map(sector_per_map).fillna(0.0)
     else: sector_per_map = {}
     
-    # 랭킹 재정렬
     combined_df = combined_df.sort_values('순현금비율(%)', ascending=False).reset_index(drop=True)
     if '순위' in combined_df.columns: combined_df = combined_df.drop(columns=['순위'])
     combined_df.insert(0, '순위', range(1, len(combined_df) + 1))
@@ -276,7 +292,7 @@ def process_market_data(mode="sp1500", resume=False):
     
     added_count = len(temp_list)
     if interrupted:
-        msg = f"🚨 야후 IP 차단 감지! 임시 저장됨. (이번 턴에 추가된 종목: {added_count}개 | 남은 종목: {total - i}개 | 진행시간: {elapsed_str}) ➡️ IP 차단이 풀린 후 다시 [이어서 수집] 버튼을 눌러주세요."
+        msg = f"🚨 야후 IP 차단 감지! 임시 저장됨. (이번 턴에 추가된 종목: {added_count}개 | 남은 종목: {total - i}개 | 진행시간: {elapsed_str}) ➡️ 잠시 후 [이어서 수집]을 눌러주세요."
     else:
         msg = f"✅ 수집 완료! (이번 턴에 추가된 종목: {added_count}개 | 진행시간: {elapsed_str})"
         
@@ -289,7 +305,7 @@ if 'quant_data' not in st.session_state:
     st.session_state['quant_data'] = None
     st.session_state['sector_per_map'] = {}
     st.session_state['last_updated'] = "수집 전"
-    st.session_state['scan_msg'] = "" # 영구 알림 메세지 저장소
+    st.session_state['scan_msg'] = "" 
     
     global_data = load_global_data()
     if global_data is not None:
@@ -302,7 +318,7 @@ if st.query_params.get("admin") == ADMIN_SECRET_CODE: st.session_state['is_admin
 
 if st.session_state['quant_data'] is None:
     if st.session_state['is_admin']:
-        st.title("🛠️ 데이터 수집 센터")
+        st.markdown("## 🛠️ 데이터 수집 센터")
         
         if st.session_state['scan_msg']:
             if "완료" in st.session_state['scan_msg']: st.success(st.session_state['scan_msg'])
@@ -312,7 +328,6 @@ if st.session_state['quant_data'] is None:
         with col1:
             st.subheader("1️⃣ S&P 1500 (대/중/소형주)")
             st.caption("예상 시간: 10~15분. 상대적으로 차단 확률 낮음.")
-            
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("🚀 전체 새로 수집", key="sp_new"):
@@ -338,7 +353,6 @@ if st.session_state['quant_data'] is None:
         with col2:
             st.subheader("2️⃣ 미국 전체 주식 (6,000+)")
             st.caption("예상 시간: 1~2시간. 차단 확률 매우 높음 (이어서 수집 적극 활용)")
-            
             c3, c4 = st.columns(2)
             with c3:
                 if st.button("🔥 전체 새로 수집", key="us_new", type="primary"):
@@ -360,23 +374,36 @@ if st.session_state['quant_data'] is None:
                             st.session_state['last_updated'], st.session_state['scan_msg'] = f"{updated_time} (전수)", msg
                             st.rerun()
                         except Exception as e: st.error(f"에러: {e}")
-
         st.stop()
         
     else:
-        st.title("💰 피터 린치 주당 순현금 랭킹")
+        st.markdown("## 💰 피터 린치 주당 순현금 랭킹")
         st.info("관리자가 실시간 마켓 데이터를 수집하고 있습니다. 잠시 후 다시 접속해 주세요.")
         st.stop()
 
 # =============================================================================
 # 7. 메인 UI 화면 
 # =============================================================================
-st.title("💰 피터 린치 주당 순현금 랭킹")
+# 💡 [UI 보완] 제목 크기 축소 (st.title -> st.markdown header)
+st.markdown("## 💰 피터 린치 주당 순현금 랭킹")
 st.caption(f"최근 데이터 동기화: {st.session_state['last_updated']}")
 
 tab1, tab2, tab3 = st.tabs(["대시보드", "Net Cash 랭킹 보드", "개별 종목 딥다이브"])
 
 with tab1:
+    # 💡 [신규 기능] 간밤의 미국 증시 뉴스 배치
+    st.markdown("### 📰 간밤의 미국 증시 헤드라인")
+    news_list = fetch_overnight_news()
+    if news_list:
+        for item in news_list:
+            title = item.get('title', 'No Title')
+            link = item.get('link', '#')
+            publisher = item.get('publisher', 'Unknown')
+            st.markdown(f"- [{title}]({link}) *(출처: {publisher})*")
+    else:
+        st.info("현재 불러올 수 있는 최신 뉴스가 없습니다.")
+    st.divider()
+
     st.subheader("💡 피터 린치의 오리지널 순현금 모델")
     st.markdown('''
     "어떤 회사의 주당 순현금이 3달러이고 주가가 10달러라면, 당신은 이 주식을 10달러가 아니라 **실질적으로 7달러**에 사는 것이다." 
@@ -391,7 +418,6 @@ with tab1:
     if st.session_state['is_admin']:
         st.markdown("### 🛠️ [관리자 전용] 데이터 갱신 패널")
         
-        # 💡 [UI 보완] 성공/경고 메세지를 영구적으로 박제 (사라지지 않음)
         if st.session_state['scan_msg']:
             if "완료" in st.session_state['scan_msg']: st.success(st.session_state['scan_msg'])
             else: st.error(st.session_state['scan_msg'])
@@ -535,7 +561,7 @@ with tab3:
                 try:
                     raw = calculate_single_stock_lynch_model(tk)
                     if not raw:
-                        st.error("데이터 부족, 상장폐지, 또는 순현금 분석에서 제외되는 금융/리츠 섹터입니다.")
+                        st.error("데이터 부족, 상장폐지, 또는 순현금 분석에서 제외되는 조건(금융, ADR, 초소형 등)입니다.")
                     else:
                         price = raw['현재주가($)']
                         net_cash_per_share = raw['주당순현금($)']
